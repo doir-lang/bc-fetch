@@ -1,0 +1,209 @@
+/// A JSON-RPC transport: messages framed by `Content-Length` headers, read from and written to file descriptors, as Language Server Protocol clients speak over a server's stdin and stdout.
+///
+/// Examples:
+/// ---
+/// static import core.sys.posix.unistd;
+/// int[2] ends;
+/// assert(core.sys.posix.unistd.pipe(ends) == 0);
+/// assert(send(ends[1], `{"a":1}`));
+/// cast(void) core.sys.posix.unistd.close(ends[1]);
+/// Reader r = Reader(ends[0]);
+/// scope(exit) free(r);
+/// assert(next(r) == `{"a":1}` && next(r) is null && r.closed);
+/// cast(void) core.sys.posix.unistd.close(ends[0]);
+/// ---
+module bc.jsonrpc;
+
+static import core.stdc.errno;
+static import core.sys.posix.unistd;
+
+static import std.typecons;
+
+static import fp.dynarray;
+
+@nogc nothrow:
+
+
+/// Reads framed messages from `fd`. Plain data, released by `free`; it does not close `fd`.
+struct Reader {
+	int fd; /// Where messages come from.
+	bool closed; /// Set once `fd` has ended or failed, or an allocation was refused.
+	private char* buffer = null; // bytes read but not yet handed out, from `start`
+	private size_t start;
+}
+
+/// Releases `r`'s buffer.
+///
+/// Examples:
+/// ---
+/// Reader r = Reader(0);
+/// free(r);
+/// ---
+void free(ref Reader r) {
+	fp.dynarray.free(r.buffer);
+	r.buffer = null;
+	r.start = 0;
+}
+
+private bool lower(char c, char want) {
+	return (c >= 'A' && c <= 'Z' ? cast(char) (c + 32) : c) == want;
+}
+
+// Where a message's body starts in its reader's buffer, and how long it is.
+private struct Frame {
+	size_t bodyStart, bodyLength;
+}
+
+// The frame of the message at `r.start`, whose body may not be buffered yet; null until its header is.
+private std.typecons.Nullable!Frame framed(ref const Reader r) @trusted {
+	auto bytes = r.buffer[r.start .. fp.dynarray.length(r.buffer)];
+	size_t end = 0;
+	while (end + 4 <= bytes.length && bytes[end .. end + 4] != "\r\n\r\n") ++end;
+	if (end + 4 > bytes.length) return typeof(return).init;
+	size_t bodyLength = 0;
+	static immutable field = "content-length:";
+	for (size_t line = 0; line < end;) {
+		size_t stop = line;
+		while (stop < end && bytes[stop] != '\r') ++stop;
+		auto header = bytes[line .. stop];
+		bool matches = header.length > field.length;
+		foreach (i, c; field) if (matches && !lower(header[i], c)) matches = false;
+		if (matches) {
+			foreach (c; header[field.length .. $]) {
+				if (c == ' ') continue;
+				if (c < '0' || c > '9') break;
+				bodyLength = bodyLength * 10 + (c - '0');
+			}
+		}
+		line = stop + 2;
+	}
+	return typeof(return)(Frame(r.start + end + 4, bodyLength));
+}
+
+// Whether the whole of the message `frame` describes is in `r.buffer`.
+private bool arrived(ref const Reader r, std.typecons.Nullable!Frame frame) {
+	return !frame.isNull && frame.get.bodyStart + frame.get.bodyLength <= fp.dynarray.length(r.buffer);
+}
+
+/// Whether a whole message is already buffered, so `next` would not wait: a server drains a burst of edits before answering any.
+///
+/// Examples:
+/// ---
+/// Reader r = Reader(0);
+/// assert(!buffered(r));
+/// ---
+bool buffered(ref const Reader r) {
+	return r.buffer !is null && arrived(r, framed(r));
+}
+
+/// The next message's body, read from `r.fd` as needed; it stays valid until the next call.
+///
+/// Returns null, setting `r.closed`, once `fd` ends, fails, or an allocation is refused.
+///
+/// Examples:
+/// ---
+/// Reader r = Reader(-1);
+/// assert(next(r) is null && r.closed);
+/// ---
+const(char)[] next(ref Reader r) @trusted {
+	for (;;) {
+		if (r.buffer !is null) {
+			immutable frame = framed(r);
+			if (arrived(r, frame)) {
+				r.start = frame.get.bodyStart + frame.get.bodyLength;
+				return r.buffer[frame.get.bodyStart .. r.start];
+			}
+		}
+		if (r.closed) return null;
+		// What was handed out goes before more is read, so the buffer holds one message at most plus what follows it.
+		immutable kept = fp.dynarray.length(r.buffer) - r.start;
+		if (r.start) {
+			foreach (i; 0 .. kept) r.buffer[i] = r.buffer[r.start + i];
+			cast(void) fp.dynarray.popBackCount(r.buffer, r.start);
+			r.start = 0;
+		}
+		// Once the header gives the length, room for the body is made once: growing per read copied a large document quadratically.
+		enum size_t chunk = 1 << 16;
+		size_t size = chunk;
+		if (r.buffer !is null) {
+			immutable frame = framed(r);
+			if (!frame.isNull && frame.get.bodyStart + frame.get.bodyLength - kept > chunk) size = frame.get.bodyStart + frame.get.bodyLength - kept;
+		}
+		if (fp.dynarray.growToSize(r.buffer, kept + size) is null) {
+			r.closed = true;
+			return null;
+		}
+		ptrdiff_t got;
+		do got = core.sys.posix.unistd.read(r.fd, r.buffer + kept, size);
+		while (got < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR);
+		cast(void) fp.dynarray.popBackCount(r.buffer, size - (got > 0 ? got : 0));
+		if (got <= 0) r.closed = true;
+	}
+}
+
+private bool writeAll(int fd, const(char)[] bytes) @trusted {
+	while (bytes.length) {
+		immutable wrote = core.sys.posix.unistd.write(fd, bytes.ptr, bytes.length);
+		if (wrote < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR) continue;
+		if (wrote <= 0) return false;
+		bytes = bytes[wrote .. $];
+	}
+	return true;
+}
+
+/// Writes `body` to `fd` as one message, its `Content-Length` header first.
+///
+/// Returns false if `fd` fails, perhaps partway through the message.
+///
+/// Examples:
+/// ---
+/// assert(!send(-1, "{}"));
+/// ---
+bool send(int fd, const(char)[] body) {
+	char[48] header = "Content-Length: ";
+	size_t at = 16;
+	char[20] digits;
+	size_t n = 0, v = body.length;
+	do {
+		digits[n++] = cast(char) ('0' + v % 10);
+		v /= 10;
+	} while (v);
+	while (n) header[at++] = digits[--n];
+	foreach (c; "\r\n\r\n") header[at++] = c;
+	return writeAll(fd, header[0 .. at]) && writeAll(fd, body);
+}
+
+
+unittest { // messages split across reads and run together come out whole and in order, and a header block without a length is skipped
+	static import core.sys.posix.unistd;
+	int[2] ends;
+	assert(core.sys.posix.unistd.pipe(ends) == 0);
+	static immutable stream = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}content-length:2\r\n\r\n[]X-Other: 1\r\n\r\nContent-Length: 0\r\n\r\n";
+	foreach (c; stream) assert(core.sys.posix.unistd.write(ends[1], &c, 1) == 1);
+	cast(void) core.sys.posix.unistd.close(ends[1]);
+	Reader r = Reader(ends[0]);
+	scope(exit) free(r);
+	assert(next(r) == `{"a":1}`);
+	assert(buffered(r) && next(r) == "[]");
+	assert(next(r).length == 0 && !r.closed);
+	assert(next(r).length == 0 && !r.closed);
+	assert(next(r) is null && r.closed);
+	cast(void) core.sys.posix.unistd.close(ends[0]);
+
+	// A message many reads long arrives whole, read into room made once its header is in.
+	static import core.stdc.stdio;
+	auto file = core.stdc.stdio.tmpfile();
+	assert(file !is null);
+	scope(exit) cast(void) core.stdc.stdio.fclose(file);
+	enum size_t big = 3 << 20;
+	char* body = null;
+	scope(exit) fp.dynarray.free(body);
+	assert(fp.dynarray.growToSize(body, big) !is null);
+	foreach (i; 0 .. big) body[i] = cast(char) ('a' + i % 26);
+	immutable fd = core.stdc.stdio.fileno(file);
+	assert(send(fd, body[0 .. big]) && core.sys.posix.unistd.lseek(fd, 0, 0) == 0);
+	Reader large = Reader(fd);
+	scope(exit) free(large);
+	assert(next(large) == body[0 .. big]);
+	assert(fp.dynarray.capacity(large.buffer) < big + (1 << 17));
+}
