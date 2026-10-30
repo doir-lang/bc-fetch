@@ -1,0 +1,14 @@
+.dub/
+dub.selections.json
+*.o
+*.obj
+*.lst
+*.a
+*.lib
+*.pdb
+bc-fetch
+bc-fetch.exe
+bc-fetch-test-*
+__test__library__
+__dummy.html
+bin
