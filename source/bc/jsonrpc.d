@@ -174,36 +174,67 @@ bool send(int fd, const(char)[] body) {
 }
 
 
-unittest { // messages split across reads and run together come out whole and in order, and a header block without a length is skipped
-	static import core.sys.posix.unistd;
-	int[2] ends;
-	assert(core.sys.posix.unistd.pipe(ends) == 0);
+version (unittest) {
+	version (WASI) {
+		static import core.sys.posix.fcntl;
+
+		// druntime declares no lseek for WASI, whose off_t is 64 bits.
+		private extern (C) long lseek(int fd, long offset, int whence);
+	} else static import core.stdc.stdio;
+
+	// A file to write messages into and read back: WASI preview 1 has neither pipes nor tmpfile.
+	private int scratch() @trusted {
+		version (WASI) return core.sys.posix.fcntl.open("/tmp/bc-jsonrpc-test", core.sys.posix.fcntl.O_RDWR | core.sys.posix.fcntl.O_CREAT | core.sys.posix.fcntl.O_TRUNC, 384);
+		else {
+			auto file = core.stdc.stdio.tmpfile();
+			assert(file !is null);
+			scope(exit) cast(void) core.stdc.stdio.fclose(file);
+			return core.sys.posix.unistd.dup(core.stdc.stdio.fileno(file));
+		}
+	}
+
+	// Moves `fd` back to its start, to read what was written.
+	private bool rewind(int fd) {
+		version (WASI) return lseek(fd, 0, 0) == 0;
+		else return core.sys.posix.unistd.lseek(fd, 0, 0) == 0;
+	}
+}
+
+unittest { // messages split across writes and run together come out whole and in order, and a header block without a length is skipped
+	immutable fd = scratch();
+	assert(fd >= 0);
+	scope(exit) cast(void) core.sys.posix.unistd.close(fd);
 	static immutable stream = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}content-length:2\r\n\r\n[]X-Other: 1\r\n\r\nContent-Length: 0\r\n\r\n";
-	foreach (c; stream) assert(core.sys.posix.unistd.write(ends[1], &c, 1) == 1);
-	cast(void) core.sys.posix.unistd.close(ends[1]);
-	Reader r = Reader(ends[0]);
+	foreach (c; stream) assert(core.sys.posix.unistd.write(fd, &c, 1) == 1);
+	assert(rewind(fd));
+	Reader r = Reader(fd);
 	scope(exit) free(r);
 	assert(next(r) == `{"a":1}`);
 	assert(buffered(r) && next(r) == "[]");
 	assert(next(r).length == 0 && !r.closed);
 	assert(next(r).length == 0 && !r.closed);
 	assert(next(r) is null && r.closed);
-	cast(void) core.sys.posix.unistd.close(ends[0]);
 
 	// A message many reads long arrives whole, read into room made once its header is in.
-	static import core.stdc.stdio;
-	auto file = core.stdc.stdio.tmpfile();
-	assert(file !is null);
-	scope(exit) cast(void) core.stdc.stdio.fclose(file);
-	enum size_t big = 3 << 20;
+	immutable big = scratch();
+	assert(big >= 0);
+	scope(exit) cast(void) core.sys.posix.unistd.close(big);
+	enum size_t size = 3 << 20;
 	char* body = null;
 	scope(exit) fp.dynarray.free(body);
-	assert(fp.dynarray.growToSize(body, big) !is null);
-	foreach (i; 0 .. big) body[i] = cast(char) ('a' + i % 26);
-	immutable fd = core.stdc.stdio.fileno(file);
-	assert(send(fd, body[0 .. big]) && core.sys.posix.unistd.lseek(fd, 0, 0) == 0);
-	Reader large = Reader(fd);
+	assert(fp.dynarray.growToSize(body, size) !is null);
+	foreach (i; 0 .. size) body[i] = cast(char) ('a' + i % 26);
+	assert(send(big, body[0 .. size]) && rewind(big));
+	Reader large = Reader(big);
 	scope(exit) free(large);
-	assert(next(large) == body[0 .. big]);
-	assert(fp.dynarray.capacity(large.buffer) < big + (1 << 17));
+	assert(next(large) == body[0 .. size]);
+	assert(fp.dynarray.capacity(large.buffer) < size + (1 << 17));
+
+	// No room to read into closes the reader.
+	static import fp.testing;
+	Reader starved = Reader(big);
+	scope(exit) free(starved);
+	auto previous = fp.testing.beginRationedAllocator(0);
+	assert(next(starved) is null && starved.closed);
+	fp.testing.endRationedAllocator(previous);
 }

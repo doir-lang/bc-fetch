@@ -138,9 +138,10 @@ def main():
 	for old in glob.glob(os.path.join(out, '*.d')):
 		os.remove(old)
 
-	sources = sorted(glob.glob(os.path.join(root, 'source', 'bc', '*.d')))
+	sources = sorted(glob.glob(os.path.join(root, 'source', 'bc', '**', '*.d'), recursive=True))
 	# Import paths outside the root are libfp's, whose modules must be compiled in too, or they would not link.
 	import_paths = describe('--import-paths')
+	libraries = describe('--data=libs', '--data-list')
 	dependencies = sorted(f for p in import_paths if not inside_root(p)
 		for f in glob.glob(os.path.join(p, '**', '*.d'), recursive=True))
 	reachable = [m for p, m in zip(sources + dependencies, modules_in(sources + dependencies))
@@ -182,7 +183,7 @@ def main():
 
 	debug_flag = '-debug' if 'dmd' in os.path.basename(compiler) else '-d-debug'
 	command = [compiler, '-betterC', '-checkaction=C', '-unittest', debug_flag, *('-I' + p for p in import_paths), '-I' + out,
-		'-of=' + exe] + sources + dependencies + sorted(glob.glob(os.path.join(out, '*.d')))
+		'-of=' + exe, *('-L-l' + l for l in libraries)] + sources + dependencies + sorted(glob.glob(os.path.join(out, '*.d')))
 	if subprocess.run(command, cwd=root).returncode != 0:
 		return 1
 	if subprocess.run([exe], cwd=root).returncode != 0:

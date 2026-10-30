@@ -710,23 +710,25 @@ unittest { // a built document reads as a parsed one does, nests and escapes, an
 	Writer w;
 	scope(exit) free(w);
 	beginObject(w);
-	key(w, "list"); beginArray(w); number(w, 0); string_(w, "\x01"); beginObject(w); endObject(w); endArray(w);
+	key(w, "list"); beginArray(w); number(w, 0); string_(w, "\x01\"\\\n\r\t"); beginObject(w); endObject(w); endArray(w);
 	key(w, "n"); null_(w);
+	key(w, "b"); boolean(w, false);
 	key(w, "copied"); raw(w, `{"x": [true, false], "y": {}}`);
 	endObject(w);
 	assert(!w.refused);
 	immutable list = member(w.document, 0, "list");
 	assert(length(w.document, list) == 3 && w.document.nodes[element(w.document, list, 2)].kind == Kind.object);
-	assert(member(w.document, 0, "n") != none);
+	assert(member(w.document, 0, "n") != none && member(w.document, 0, "missing") == none);
+	assert(w.document.nodes[member(w.document, 0, "b")].kind == Kind.false_);
 	bool refused;
 	auto s = string_(w.document, element(w.document, list, 1), refused);
 	scope(exit) fp.string.free(s);
-	assert(fp.string.slice(s) == "\x01" && !refused);
+	assert(fp.string.slice(s) == "\x01\"\\\n\r\t" && !refused);
 	immutable copied = member(w.document, 0, "copied");
 	assert(boolean(w.document, element(w.document, member(w.document, copied, "x"), 0)) && member(w.document, copied, "y") != none);
 	char* printed = stringify(w.document);
 	scope(exit) fp.string.free(printed);
-	assert(fp.string.slice(printed) == `{"list":[0,"\u0001",{}],"n":null,"copied":{"x":[true,false],"y":{}}}`);
+	assert(fp.string.slice(printed) == `{"list":[0,"\u0001\"\\\n\r\t",{}],"n":null,"b":false,"copied":{"x":[true,false],"y":{}}}`);
 
 	Document d;
 	scope(exit) free(d);
@@ -747,13 +749,31 @@ unittest { // a built document reads as a parsed one does, nests and escapes, an
 	for (size_t budget = 0;; ++budget) {
 		Writer r;
 		auto previous = fp.testing.beginRationedAllocator(budget);
-		beginObject(r); key(r, "k"); string_(r, "a\tb"); key(r, "r"); raw(r, `[1]`); endObject(r);
+		beginObject(r); key(r, "k"); string_(r, "a\tbcdefghijklmnopqrstuvwxyz"); key(r, "r"); raw(r, `[1]`); endObject(r);
 		char* result = r.refused ? null : stringify(r.document);
 		fp.testing.endRationedAllocator(previous);
 		free(r);
 		if (result is null) continue;
-		assert(fp.string.slice(result) == `{"k":"a\tb","r":[1]}`);
+		assert(fp.string.slice(result) == `{"k":"a\tbcdefghijklmnopqrstuvwxyz","r":[1]}`);
 		fp.string.free(result);
 		break;
 	}
+
+	// Integers that are not numbers, have fractions, or do not fit give the fallback.
+	Document numbers;
+	scope(exit) free(numbers);
+	assert(parse(`[12, -7, 1.5, 99999999999999999999, "x"]`, numbers) == Parsed.ok);
+	assert(integer(numbers, element(numbers, 0, 0)) == 12 && integer(numbers, element(numbers, 0, 1)) == -7);
+	foreach (i; 2 .. 6) assert(integer(numbers, element(numbers, 0, i), 3) == 3);
+
+	// Escapes decode, a surrogate pair to one character, and a broken `\u` or lone surrogate to U+FFFD.
+	Document escaped;
+	scope(exit) free(escaped);
+	assert(parse(`"\u00e9\u00C9\uZZZZ\ud83d\ude00\ud83d\u0041\ude00\/\"\\\n\r\t\b\f"`, escaped) == Parsed.ok);
+	auto decoded = string_(escaped, 0, refused);
+	scope(exit) fp.string.free(decoded);
+	assert(!refused && fp.string.slice(decoded) == "éÉ\uFFFDZZZZ\U0001F600\uFFFDA\uFFFD/\"\\\n\r\t\b\f");
+	auto previous = fp.testing.beginRationedAllocator(0);
+	assert(string_(escaped, 0, refused) is null && refused);
+	fp.testing.endRationedAllocator(previous);
 }
