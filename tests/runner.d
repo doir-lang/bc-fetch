@@ -5,6 +5,7 @@ import core.stdc.stdio : fprintf, printf, stderr;
 private enum modules = [
 	"bc.json",
 	"bc.jsonrpc",
+	"bc.http.message",
 ];
 
 private int runEveryTest() {

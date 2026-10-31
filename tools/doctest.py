@@ -138,7 +138,7 @@ def main():
 	for old in glob.glob(os.path.join(out, '*.d')):
 		os.remove(old)
 
-	sources = sorted(glob.glob(os.path.join(root, 'source', 'bc', '*.d')))
+	sources = sorted(glob.glob(os.path.join(root, 'source', 'bc', '**', '*.d'), recursive=True))
 	# Import paths outside the root are libfp's, whose modules must be compiled in too, or they would not link.
 	import_paths = describe('--import-paths')
 	dependencies = sorted(f for p in import_paths if not inside_root(p)

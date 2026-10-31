@@ -4,8 +4,9 @@ JSON and JSON-RPC for `-betterC` D, which has no Phobos, on [libfp](https://gith
 
 - `bc.json` — editable documents: minified JSON text with an index of its values, so finding a member or an element allocates nothing. `parse` reads one, `set`, `append`, `insert`, `replace` and `remove` edit it in place, `json` gives its text and `pretty` lays it out; a `Value` names one value, `v["key"][0]`, and stays valid across edits.
 - `bc.jsonrpc` — JSON-RPC messages framed by `Content-Length` headers over file descriptors, as Language Server Protocol clients speak over a server's stdin and stdout.
+- `bc.http.message` — HTTP/1.1 without I/O: parse URLs, write request heads, and read response heads and bodies, `chunked` included, from bytes already received.
 
-Call these modules' functions fully qualified, as in `bc.json.parse(text)` or `bc.jsonrpc.send(fd, body)`: both define `free`.
+Call these modules' functions fully qualified, as in `bc.json.parse(text)` or `bc.jsonrpc.send(fd, body)`: several define `free`.
 They share package `bc` with [bc-threads](https://github.com/doir-lang/bc-threads).
 
 ## Building
