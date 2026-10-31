@@ -16,6 +16,7 @@ They share package `bc` with [bc-threads](https://github.com/doir-lang/bc-thread
 dub build --config=library --compiler=ldc2   # static library
 dub test --compiler=ldc2                     # build and run the unittests
 python3 tools/doctest.py                     # compile and run every DDoc example
+python3 tools/coverage.py                    # per-module unittest coverage; -v lists every uncovered line
 python3 tools/wasi.py --node                 # build the unittests for wasm32-wasi and run them under Node
 python3 tools/wasi.py --browser              # ... or in headless Firefox; --serve serves them to open in any browser
 ```
@@ -28,6 +29,9 @@ LDC only: libfp, which this depends on, refuses DMD at compile time, so `dub.jso
 ## Testing
 
 `-betterC` has no unittest runner of its own, so [tests/runner.d](tests/runner.d) walks each `bc` module with `__traits(getUnitTests)` and calls the tests itself, reporting each module and test index to `stderr` as it goes.
+
+`-cov` records its line counts through druntime, which `-betterC` does not have, so [tools/coverage.py](tools/coverage.py) builds the same sources and tests as ordinary D: the runner supplies a druntime `main` when `BchCoverage` is set and disables druntime's own test pass, so the tests still run once.
+It compiles bc-threads and libfp in alongside, links what `dub describe` lists, and reports only `bc-fetch`'s own modules; lines compiled out on the host are left out of the totals.
 
 ## WebAssembly
 
