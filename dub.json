@@ -1,6 +1,6 @@
 {
   "name": "bc-fetch",
-  "description": "JSON and JSON-RPC for -betterC D",
+  "description": "HTTP, JSON and JSON-RPC for -betterC D",
   "targetType": "staticLibrary",
   "toolchainRequirements": {
     "dmd": "no"
@@ -12,9 +12,9 @@
     "source"
   ],
   "dependencies": {
-    "libfp": {
-      "repository": "git+https://github.com/doir-lang/libfp.git",
-      "version": "66ca748cc42b3fdd58fc8bd831f5f159334c870a"
+    "bc-threads": {
+      "repository": "git+https://github.com/doir-lang/bc-thread.git",
+      "version": "3b33cde42ec0e28dfafcfa288156f023dcbca700"
     }
   },
   "dflags-ldc": [
@@ -37,5 +37,9 @@
         "tests"
       ]
     }
+  ],
+  "libs-posix": [
+    "ssl",
+    "crypto"
   ]
 }
