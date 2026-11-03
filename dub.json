@@ -14,7 +14,7 @@
   "dependencies": {
     "bc-threads": {
       "repository": "git+https://github.com/doir-lang/bc-thread.git",
-      "version": "3b33cde42ec0e28dfafcfa288156f023dcbca700"
+      "version": "fac95861934b4b795e58745f11e8ec4bcd85949a"
     }
   },
   "dflags-ldc": [
@@ -41,5 +41,10 @@
   "libs-posix": [
     "ssl",
     "crypto"
+  ],
+  "libs-windows": [
+    "ws2_32",
+    "secur32",
+    "crypt32"
   ]
 }

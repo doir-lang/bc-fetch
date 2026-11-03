@@ -1,6 +1,6 @@
 /// An HTTP client shaped like fetch, for native builds and `wasm32-wasi` alike: a `Request` is plain data, `start` begins a `Fetch` without blocking, `poll` advances it, and `readBody` hands its body over as it arrives. `fetch` and `readAll` block, for code that would rather wait.
 ///
-/// It promises only what a browser's fetch can do, so code behaves the same on every target: no setting `Host` or other connection fields, and no reading cookies. Natively it speaks HTTP/1.1 over a socket per request, through `bc.http.message`, with OpenSSL for `https`, checking certificates against the system's trusted ones, and resolves host names on a thread so nothing blocks. On `wasm32-wasi` it calls the host's fetch through the `bc_http` imports that `js/bc-fetch.mjs` provides, and the module must export `bc_http_wake`.
+/// It promises only what a browser's fetch can do, so code behaves the same on every target: no setting `Host` or other connection fields, and no reading cookies. Natively it speaks HTTP/1.1 over a socket per request, through `bc.http.message`, with OpenSSL for `https`, or SChannel on Windows, checking certificates against the system's trusted ones, and resolves host names on a thread so nothing blocks. On `wasm32-wasi` it calls the host's fetch through the `bc_http` imports that `js/bc-fetch.mjs` provides, and the module must export `bc_http_wake`.
 ///
 /// Examples:
 /// ---
@@ -41,10 +41,28 @@ version (WASI) {
 
 	static import bc.spinlock;
 	static import bc.thread;
+} else version (Windows) {
+	static import core.atomic;
+	static import core.stdc.stdlib;
+
+	static import ldc.attributes;
+
+	static import fp.string;
+
+	static import bc.spinlock;
+	static import bc.thread;
 } else static assert(0, "bc.http: no backend for this target");
 
 @nogc nothrow:
 
+version (Windows) version (D_BetterC) {
+	// MSVC's linker resolves references even from template code nothing calls, and `Nullable!(const(char)[]).toHash` calls this, which druntime defines.
+	private @(ldc.attributes.weak) pragma(mangle, "_D4core8internal4hash19_bytesHashUnalignedFNaNbNiNeMAxhmZm")
+	size_t bytesHashUnaligned(scope const(ubyte)[] bytes, size_t seed) pure @trusted {
+		foreach (b; bytes) seed = (seed ^ b) * 0x100000001B3;
+		return seed;
+	}
+}
 
 // --- headers -----------------------------------------------------------------
 
@@ -228,7 +246,7 @@ enum Failure : ubyte {
 	none, /// It has not.
 	invalidRequest, /// The method is not a token or is one fetch forbids, such as `CONNECT`, or a `GET` or `HEAD` request has a body.
 	invalidUrl, /// The URL could not be parsed.
-	unsupported, /// The URL's scheme is not one this target can fetch, such as `ftp`, or OpenSSL could not set up `https`.
+	unsupported, /// The URL's scheme is not one this target can fetch, such as `ftp`, or OpenSSL or SChannel could not set up `https`.
 	network, /// The host could not be found or reached, its certificate was not trusted for its name, the connection broke, or the response was not HTTP.
 	timeout, /// `Request.timeoutMs` passed.
 	tooManyRedirects, /// It was redirected more than `maxRedirects` times. A browser does not say so, and reports `network` instead.
@@ -242,30 +260,56 @@ version (WASI) {
 	private struct Exchange {
 		int id;
 	}
-} else version (Posix) {
+} else {
 	private enum Phase : ubyte { resolving, connecting, handshaking, sending, receiving }
 
-	// A native exchange: its connection, a copy of the request to send again when redirected, and bytes received but not yet handed over.
-	private struct Exchange {
-		int fd = -1;
-		Phase phase;
-		short events; // what `fd` must be ready for before `advance` can go on
-		bool eof;
-		ubyte redirects;
-		Redirect redirect;
-		Lookup* lookup;
-		core.sys.posix.netdb.addrinfo* next; // the address to try if connecting fails
-		Tls tls;
-		char* method = null;
-		Headers headers;
-		char* payload = null;
-		char* out_ = null;
-		char* wire = null; // TLS records waiting to be sent
-		size_t sent;
-		char* in_ = null;
-		bc.http.message.Body body;
-		char* ready = null;
-		size_t taken;
+	version (Posix) {
+
+		// A native exchange: its connection, a copy of the request to send again when redirected, and bytes received but not yet handed over.
+		private struct Exchange {
+			int fd = -1;
+			Phase phase;
+			short events; // what `fd` must be ready for before `advance` can go on
+			bool eof;
+			ubyte redirects;
+			Redirect redirect;
+			Lookup* lookup;
+			core.sys.posix.netdb.addrinfo* next; // the address to try if connecting fails
+			Tls tls;
+			char* method = null;
+			Headers headers;
+			char* payload = null;
+			char* out_ = null;
+			char* wire = null; // TLS records waiting to be sent
+			size_t sent;
+			char* in_ = null;
+			bc.http.message.Body body;
+			char* ready = null;
+			size_t taken;
+		}
+	} else version (Windows) {
+		// A native exchange: its connection and readiness event, a copy of the request to send again when redirected, and bytes not yet handed over.
+		private struct Exchange {
+			size_t fd = invalidSocket;
+			void* event;
+			Phase phase;
+			bool eof;
+			ubyte redirects;
+			Redirect redirect;
+			Lookup* lookup;
+			AddressInfo* next; // the address to try if connecting fails
+			Tls tls;
+			char* method = null;
+			Headers headers;
+			char* payload = null;
+			char* out_ = null;
+			char* wire = null; // TLS records waiting to be sent
+			size_t sent;
+			char* in_ = null;
+			bc.http.message.Body body;
+			char* ready = null;
+			size_t taken;
+		}
 	}
 }
 
@@ -410,7 +454,7 @@ version (WASI) {
 // --- the native backend ------------------------------------------------------
 
 version (WASI) {
-} else version (Posix) {
+} else {
 	version (unittest) {
 		static import fp.pointer;
 
@@ -440,123 +484,6 @@ version (WASI) {
 			failureArmed = true;
 			fp.pointer.allocFunction = &failingAllocFunction;
 		}
-	}
-
-	private long milliseconds() @trusted {
-		core.sys.posix.time.timespec t;
-		cast(void) core.sys.posix.time.clock_gettime(core.sys.posix.time.CLOCK_MONOTONIC, &t);
-		return t.tv_sec * 1000L + t.tv_nsec / 1_000_000;
-	}
-
-	// The OpenSSL 3 functions https uses; dub.json links libssl and libcrypto.
-	private extern (C) {
-		struct SSL_METHOD;
-		struct SSL_CTX;
-		struct SSL;
-		struct BIO;
-		struct BIO_METHOD;
-		struct X509_VERIFY_PARAM;
-		const(SSL_METHOD)* TLS_client_method();
-		SSL_CTX* SSL_CTX_new(const(SSL_METHOD)* method);
-		void SSL_CTX_free(SSL_CTX* context);
-		int SSL_CTX_set_default_verify_paths(SSL_CTX* context);
-		void SSL_CTX_set_verify(SSL_CTX* context, int mode, void* callback);
-		SSL* SSL_new(SSL_CTX* context);
-		void SSL_free(SSL* ssl);
-		void SSL_set_bio(SSL* ssl, BIO* read, BIO* write);
-		void SSL_set_connect_state(SSL* ssl);
-		core.stdc.config.c_long SSL_ctrl(SSL* ssl, int command, core.stdc.config.c_long argument, void* pointer);
-		int SSL_set1_host(SSL* ssl, const(char)* host);
-		X509_VERIFY_PARAM* SSL_get0_param(SSL* ssl);
-		int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM* parameters, const(char)* address);
-		int SSL_do_handshake(SSL* ssl);
-		int SSL_read(SSL* ssl, void* into, int length);
-		int SSL_write(SSL* ssl, const(void)* from, int length);
-		int SSL_get_error(const(SSL)* ssl, int result);
-		const(BIO_METHOD)* BIO_s_mem();
-		BIO* BIO_new(const(BIO_METHOD)* method);
-		int BIO_free(BIO* bio);
-		int BIO_read(BIO* bio, void* into, int length);
-		int BIO_write(BIO* bio, const(void)* from, int length);
-		size_t BIO_ctrl_pending(BIO* bio);
-		void ERR_clear_error();
-	}
-
-	private enum int sslVerifyPeer = 1, sslCtrlSetTlsextHostname = 55, sslErrorWantRead = 2, sslErrorWantWrite = 3, sslErrorZeroReturn = 6;
-
-	// One connection's TLS: the session, and the memory BIOs it reads records from and writes them to, which it owns.
-	private struct Tls {
-		SSL* ssl;
-		BIO* read;
-		BIO* write;
-	}
-
-	private __gshared SSL_CTX* tlsShared;
-	private __gshared bc.spinlock.SpinLock tlsLock;
-
-	// The context every https fetch shares, made on first use, trusting the system's certificates; null if OpenSSL could not make it.
-	private SSL_CTX* tlsContext() {
-		bc.spinlock.writeLock(tlsLock);
-		scope(exit) bc.spinlock.writeUnlock(tlsLock);
-		if (tlsShared is null) {
-			bool failed = false;
-			version (unittest) failed = simulatedFailure();
-			auto context = failed ? null : SSL_CTX_new(TLS_client_method());
-			if (context is null || SSL_CTX_set_default_verify_paths(context) != 1) {
-				if (context !is null) SSL_CTX_free(context);
-				return null;
-			}
-			SSL_CTX_set_verify(context, sslVerifyPeer, null);
-			tlsShared = context;
-		}
-		return tlsShared;
-	}
-
-	// A host name being resolved on a thread of its own, which shares it; whichever side drops the last reference frees it.
-	private struct Lookup {
-		shared int references;
-		int[2] done = -1; // the thread writes a byte to `done[1]` once `error` and `found` are set
-		int error;
-		core.sys.posix.netdb.addrinfo* found;
-		char[256] host = 0;
-		char[6] port = 0;
-	}
-
-	private void drop(Lookup* l) @trusted {
-		if (l is null || core.atomic.atomicOp!"-="(l.references, 1) != 0) return;
-		foreach (fd; l.done) if (fd >= 0) cast(void) core.sys.posix.unistd.close(fd);
-		if (l.found !is null) core.sys.posix.netdb.freeaddrinfo(l.found);
-		core.stdc.stdlib.free(l);
-	}
-
-	private int lookUp(ref Lookup l, int flags) @trusted {
-		core.sys.posix.netdb.addrinfo hints;
-		hints.ai_socktype = core.sys.posix.sys.socket.SOCK_STREAM;
-		hints.ai_flags = flags;
-		return core.sys.posix.netdb.getaddrinfo(l.host.ptr, l.port.ptr, &hints, &l.found);
-	}
-
-	private void resolveOnThread(Lookup* l) @trusted {
-		l.error = lookUp(*l, 0);
-		immutable char one = 1;
-		cast(void) core.sys.posix.unistd.write(l.done[1], &one, 1);
-		drop(l);
-	}
-
-	private void nonblocking(int fd) @trusted {
-		cast(void) core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_SETFD, core.sys.posix.fcntl.FD_CLOEXEC);
-		cast(void) core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_SETFL, core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_GETFL) | core.sys.posix.fcntl.O_NONBLOCK);
-	}
-
-	private void disconnect(ref Exchange e) {
-		if (e.fd >= 0) cast(void) core.sys.posix.unistd.close(e.fd);
-		e.fd = -1;
-		drop(e.lookup);
-		e.lookup = null;
-		e.next = null;
-		if (e.tls.ssl !is null) SSL_free(e.tls.ssl);
-		e.tls = Tls.init;
-		fp.dynarray.clear(e.wire);
 	}
 
 	private void release(ref Exchange e) {
@@ -602,57 +529,6 @@ version (WASI) {
 		return bc.http.message.writeField(e.out_, "Connection", "close") && bc.http.message.endHead(e.out_) && extend(e.out_, fp.dynarray.slice(e.payload));
 	}
 
-	// Starts connecting to the first address from `a` that takes a socket, remembering the rest; fails `f` if none does.
-	private void dial(ref Fetch f, core.sys.posix.netdb.addrinfo* a) @trusted {
-		auto e = &f.exchange;
-		for (; a !is null; a = a.ai_next) {
-			immutable fd = core.sys.posix.sys.socket.socket(a.ai_family, a.ai_socktype, a.ai_protocol);
-			if (fd < 0) continue;
-			nonblocking(fd);
-			static if (__traits(compiles, core.sys.posix.sys.socket.SO_NOSIGPIPE)) {
-				int one = 1;
-				cast(void) core.sys.posix.sys.socket.setsockopt(fd, core.sys.posix.sys.socket.SOL_SOCKET, core.sys.posix.sys.socket.SO_NOSIGPIPE, &one, one.sizeof);
-			}
-			if (core.sys.posix.sys.socket.connect(fd, a.ai_addr, a.ai_addrlen) == 0 || core.stdc.errno.errno == core.stdc.errno.EINPROGRESS) {
-				e.fd = fd;
-				e.next = a.ai_next;
-				e.phase = Phase.connecting;
-				e.events = core.sys.posix.poll.POLLOUT;
-				return;
-			}
-			cast(void) core.sys.posix.unistd.close(fd);
-		}
-		fail(f, Failure.network);
-	}
-
-	// Sets up TLS for `host`, checking the certificate against it as a name or, when `address`, an IP address; fails `f` if it cannot.
-	private bool secure(ref Fetch f, const(char)* host, bool address) @trusted {
-		auto context = tlsContext();
-		if (context is null) {
-			fail(f, Failure.unsupported);
-			return false;
-		}
-		auto t = &f.exchange.tls;
-		bool failed = false;
-		version (unittest) failed = simulatedFailure();
-		t.ssl = failed ? null : SSL_new(context);
-		auto read = BIO_new(BIO_s_mem()), write = BIO_new(BIO_s_mem());
-		if (t.ssl is null || read is null || write is null) {
-			if (read !is null) cast(void) BIO_free(read);
-			if (write !is null) cast(void) BIO_free(write);
-			fail(f, Failure.outOfMemory);
-			return false;
-		}
-		SSL_set_bio(t.ssl, read, write);
-		t.read = read;
-		t.write = write;
-		SSL_set_connect_state(t.ssl);
-		immutable named = address ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(t.ssl), host) == 1
-			: SSL_ctrl(t.ssl, sslCtrlSetTlsextHostname, 0, cast(void*) host) == 1 && SSL_set1_host(t.ssl, host) == 1;
-		if (!named) fail(f, Failure.outOfMemory);
-		return named;
-	}
-
 	// Starts fetching `f.url` afresh: writes the request, sets up TLS for https, and resolves the host, on a thread unless it is an address.
 	private void connect(ref Fetch f) @trusted {
 		auto e = &f.exchange;
@@ -679,12 +555,10 @@ version (WASI) {
 		} while (v);
 		core.stdc.string.memcpy(l.port.ptr, digits.ptr + n, digits.length - n);
 
-		immutable address = lookUp(*l, core.sys.posix.netdb.AI_NUMERICHOST) == 0;
+		immutable address = lookUp(*l, true) == 0;
 		if (https && !secure(f, l.host.ptr, address)) return;
 		if (address) return dial(f, l.found);
-		if (core.sys.posix.unistd.pipe(l.done) == 0) {
-			nonblocking(l.done[0]);
-			nonblocking(l.done[1]);
+		if (signalable(*l)) {
 			core.atomic.atomicStore(l.references, 2);
 			std.typecons.Nullable!(bc.thread.Thread) thread;
 			bool failed = false;
@@ -698,7 +572,7 @@ version (WASI) {
 			core.atomic.atomicStore(l.references, 1);
 		}
 		// Without a thread, resolving blocks here, as it would have before.
-		if (lookUp(*l, 0) != 0) return fail(f, Failure.network);
+		if (lookUp(*l, false) != 0) return fail(f, Failure.network);
 		dial(f, l.found);
 	}
 
@@ -822,6 +696,206 @@ version (WASI) {
 		return true;
 	}
 
+	private enum Pulled : ubyte { some, later, end, broken }
+
+	private size_t take(ref Fetch f, char[] into) @trusted {
+		auto e = &f.exchange;
+		immutable n = buffered(f) < into.length ? buffered(f) : into.length;
+		core.stdc.string.memcpy(into.ptr, e.ready + e.taken, n);
+		e.taken += n;
+		if (e.taken == fp.dynarray.length(e.ready)) {
+			fp.dynarray.clear(e.ready);
+			e.taken = 0;
+		}
+		return n;
+	}
+}
+
+version (WASI) {
+} else version (Posix) {
+	version (OSX) {
+		// druntime declares neither for macOS, whose <time.h> has had them since 10.12.
+		private extern (C) int clock_gettime(int clock, core.sys.posix.time.timespec* time);
+		private enum int clockMonotonic = 6;
+	}
+
+	private long milliseconds() @trusted {
+		core.sys.posix.time.timespec t;
+		version (OSX) cast(void) clock_gettime(clockMonotonic, &t);
+		else cast(void) core.sys.posix.time.clock_gettime(core.sys.posix.time.CLOCK_MONOTONIC, &t);
+		return t.tv_sec * 1000L + t.tv_nsec / 1_000_000;
+	}
+
+	// The OpenSSL 3 functions https uses; dub.json links libssl and libcrypto.
+	private extern (C) {
+		struct SSL_METHOD;
+		struct SSL_CTX;
+		struct SSL;
+		struct BIO;
+		struct BIO_METHOD;
+		struct X509_VERIFY_PARAM;
+		const(SSL_METHOD)* TLS_client_method();
+		SSL_CTX* SSL_CTX_new(const(SSL_METHOD)* method);
+		void SSL_CTX_free(SSL_CTX* context);
+		int SSL_CTX_set_default_verify_paths(SSL_CTX* context);
+		void SSL_CTX_set_verify(SSL_CTX* context, int mode, void* callback);
+		SSL* SSL_new(SSL_CTX* context);
+		void SSL_free(SSL* ssl);
+		void SSL_set_bio(SSL* ssl, BIO* read, BIO* write);
+		void SSL_set_connect_state(SSL* ssl);
+		core.stdc.config.c_long SSL_ctrl(SSL* ssl, int command, core.stdc.config.c_long argument, void* pointer);
+		int SSL_set1_host(SSL* ssl, const(char)* host);
+		X509_VERIFY_PARAM* SSL_get0_param(SSL* ssl);
+		int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM* parameters, const(char)* address);
+		int SSL_do_handshake(SSL* ssl);
+		int SSL_read(SSL* ssl, void* into, int length);
+		int SSL_write(SSL* ssl, const(void)* from, int length);
+		int SSL_get_error(const(SSL)* ssl, int result);
+		const(BIO_METHOD)* BIO_s_mem();
+		BIO* BIO_new(const(BIO_METHOD)* method);
+		int BIO_free(BIO* bio);
+		int BIO_read(BIO* bio, void* into, int length);
+		int BIO_write(BIO* bio, const(void)* from, int length);
+		size_t BIO_ctrl_pending(BIO* bio);
+		void ERR_clear_error();
+	}
+
+	private enum int sslVerifyPeer = 1, sslCtrlSetTlsextHostname = 55, sslErrorWantRead = 2, sslErrorWantWrite = 3, sslErrorZeroReturn = 6;
+
+	// One connection's TLS: the session, and the memory BIOs it reads records from and writes them to, which it owns.
+	private struct Tls {
+		SSL* ssl;
+		BIO* read;
+		BIO* write;
+	}
+
+	private __gshared SSL_CTX* tlsShared;
+	private __gshared bc.spinlock.SpinLock tlsLock;
+
+	// The context every https fetch shares, made on first use, trusting the system's certificates; null if OpenSSL could not make it.
+	private SSL_CTX* tlsContext() {
+		bc.spinlock.writeLock(tlsLock);
+		scope(exit) bc.spinlock.writeUnlock(tlsLock);
+		if (tlsShared is null) {
+			bool failed = false;
+			version (unittest) failed = simulatedFailure();
+			auto context = failed ? null : SSL_CTX_new(TLS_client_method());
+			if (context is null || SSL_CTX_set_default_verify_paths(context) != 1) {
+				if (context !is null) SSL_CTX_free(context);
+				return null;
+			}
+			SSL_CTX_set_verify(context, sslVerifyPeer, null);
+			tlsShared = context;
+		}
+		return tlsShared;
+	}
+
+	// A host name being resolved on a thread of its own, which shares it; whichever side drops the last reference frees it.
+	private struct Lookup {
+		shared int references;
+		int[2] done = -1; // the thread writes a byte to `done[1]` once `error` and `found` are set
+		int error;
+		core.sys.posix.netdb.addrinfo* found;
+		char[256] host = 0;
+		char[6] port = 0;
+	}
+
+	private void drop(Lookup* l) @trusted {
+		if (l is null || core.atomic.atomicOp!"-="(l.references, 1) != 0) return;
+		foreach (fd; l.done) if (fd >= 0) cast(void) core.sys.posix.unistd.close(fd);
+		if (l.found !is null) core.sys.posix.netdb.freeaddrinfo(l.found);
+		core.stdc.stdlib.free(l);
+	}
+
+	private int lookUp(ref Lookup l, bool numeric) @trusted {
+		core.sys.posix.netdb.addrinfo hints;
+		hints.ai_socktype = core.sys.posix.sys.socket.SOCK_STREAM;
+		hints.ai_flags = numeric ? core.sys.posix.netdb.AI_NUMERICHOST : 0;
+		return core.sys.posix.netdb.getaddrinfo(l.host.ptr, l.port.ptr, &hints, &l.found);
+	}
+
+	private void resolveOnThread(Lookup* l) @trusted {
+		l.error = lookUp(*l, false);
+		immutable char one = 1;
+		cast(void) core.sys.posix.unistd.write(l.done[1], &one, 1);
+		drop(l);
+	}
+
+	private void nonblocking(int fd) @trusted {
+		cast(void) core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_SETFD, core.sys.posix.fcntl.FD_CLOEXEC);
+		cast(void) core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_SETFL, core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_GETFL) | core.sys.posix.fcntl.O_NONBLOCK);
+	}
+
+	// Makes the pipe the resolving thread signals through; false if it cannot.
+	private bool signalable(ref Lookup l) @trusted {
+		if (core.sys.posix.unistd.pipe(l.done) != 0) return false;
+		nonblocking(l.done[0]);
+		nonblocking(l.done[1]);
+		return true;
+	}
+
+	private void disconnect(ref Exchange e) {
+		if (e.fd >= 0) cast(void) core.sys.posix.unistd.close(e.fd);
+		e.fd = -1;
+		drop(e.lookup);
+		e.lookup = null;
+		e.next = null;
+		if (e.tls.ssl !is null) SSL_free(e.tls.ssl);
+		e.tls = Tls.init;
+		fp.dynarray.clear(e.wire);
+	}
+
+	// Starts connecting to the first address from `a` that takes a socket, remembering the rest; fails `f` if none does.
+	private void dial(ref Fetch f, core.sys.posix.netdb.addrinfo* a) @trusted {
+		auto e = &f.exchange;
+		for (; a !is null; a = a.ai_next) {
+			immutable fd = core.sys.posix.sys.socket.socket(a.ai_family, a.ai_socktype, a.ai_protocol);
+			if (fd < 0) continue;
+			nonblocking(fd);
+			static if (__traits(compiles, core.sys.posix.sys.socket.SO_NOSIGPIPE)) {
+				int one = 1;
+				cast(void) core.sys.posix.sys.socket.setsockopt(fd, core.sys.posix.sys.socket.SOL_SOCKET, core.sys.posix.sys.socket.SO_NOSIGPIPE, &one, one.sizeof);
+			}
+			if (core.sys.posix.sys.socket.connect(fd, a.ai_addr, a.ai_addrlen) == 0 || core.stdc.errno.errno == core.stdc.errno.EINPROGRESS) {
+				e.fd = fd;
+				e.next = a.ai_next;
+				e.phase = Phase.connecting;
+				e.events = core.sys.posix.poll.POLLOUT;
+				return;
+			}
+			cast(void) core.sys.posix.unistd.close(fd);
+		}
+		fail(f, Failure.network);
+	}
+
+	// Sets up TLS for `host`, checking the certificate against it as a name or, when `address`, an IP address; fails `f` if it cannot.
+	private bool secure(ref Fetch f, const(char)* host, bool address) @trusted {
+		auto context = tlsContext();
+		if (context is null) {
+			fail(f, Failure.unsupported);
+			return false;
+		}
+		auto t = &f.exchange.tls;
+		bool failed = false;
+		version (unittest) failed = simulatedFailure();
+		t.ssl = failed ? null : SSL_new(context);
+		auto read = BIO_new(BIO_s_mem()), write = BIO_new(BIO_s_mem());
+		if (t.ssl is null || read is null || write is null) {
+			if (read !is null) cast(void) BIO_free(read);
+			if (write !is null) cast(void) BIO_free(write);
+			fail(f, Failure.outOfMemory);
+			return false;
+		}
+		SSL_set_bio(t.ssl, read, write);
+		t.read = read;
+		t.write = write;
+		SSL_set_connect_state(t.ssl);
+		immutable named = address ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(t.ssl), host) == 1
+			: SSL_ctrl(t.ssl, sslCtrlSetTlsextHostname, 0, cast(void*) host) == 1 && SSL_set1_host(t.ssl, host) == 1;
+		if (!named) fail(f, Failure.outOfMemory);
+		return named;
+	}
+
 	static if (__traits(compiles, core.sys.posix.sys.socket.MSG_NOSIGNAL)) private enum int sendFlags = core.sys.posix.sys.socket.MSG_NOSIGNAL;
 	else private enum int sendFlags = 0;
 
@@ -886,8 +960,6 @@ version (WASI) {
 		}
 		return true;
 	}
-
-	private enum Pulled : ubyte { some, later, end, broken }
 
 	// Moves the bytes the socket has into TLS's read BIO; on `Pulled.later` it has set `events`, and on `Pulled.broken` failed `f`.
 	private Pulled pull(ref Fetch f) @trusted {
@@ -1014,18 +1086,6 @@ version (WASI) {
 		}
 	}
 
-	private size_t take(ref Fetch f, char[] into) @trusted {
-		auto e = &f.exchange;
-		immutable n = buffered(f) < into.length ? buffered(f) : into.length;
-		core.stdc.string.memcpy(into.ptr, e.ready + e.taken, n);
-		e.taken += n;
-		if (e.taken == fp.dynarray.length(e.ready)) {
-			fp.dynarray.clear(e.ready);
-			e.taken = 0;
-		}
-		return n;
-	}
-
 	private bool waitFor(Fetch*[] fs, int timeoutMs) @trusted {
 		core.sys.posix.poll.pollfd[maxWaited] polled;
 		foreach (i, f; fs) {
@@ -1034,11 +1094,590 @@ version (WASI) {
 			polled[i] = e.phase == Phase.resolving ? core.sys.posix.poll.pollfd(e.lookup.done[0], core.sys.posix.poll.POLLIN) : core.sys.posix.poll.pollfd(e.fd, e.events);
 		}
 		int ready;
-		do ready = core.sys.posix.poll.poll(polled.ptr, fs.length, timeoutMs);
+		do ready = core.sys.posix.poll.poll(polled.ptr, cast(core.sys.posix.poll.nfds_t) fs.length, timeoutMs);
 		while (ready < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR);
 		return ready != 0;
 	}
 }
+
+version (Windows) {
+	// The Winsock, SSPI and CryptoAPI functions the native backend uses; dub.json links ws2_32, secur32 and crypt32.
+	private extern (Windows) {
+		struct AddressInfo {
+			int flags;
+			int family;
+			int socketType;
+			int protocol;
+			size_t addressLength;
+			char* canonicalName;
+			void* address;
+			AddressInfo* next;
+		}
+
+		struct NetworkEvents {
+			int happened;
+			int[10] errors;
+		}
+
+		int WSAStartup(ushort requested, void* data);
+		int WSAGetLastError();
+		size_t socket(int family, int type, int protocol);
+		pragma(mangle, "connect") int connectSocket(size_t s, const(void)* address, int length);
+		int send(size_t s, const(void)* from, int length, int flags);
+		int recv(size_t s, void* into, int length, int flags);
+		int closesocket(size_t s);
+		int getaddrinfo(const(char)* host, const(char)* port, const(AddressInfo)* hints, AddressInfo** found);
+		void freeaddrinfo(AddressInfo* found);
+		int WSAEventSelect(size_t s, void* event, int events);
+		int WSAEnumNetworkEvents(size_t s, void* event, NetworkEvents* happened);
+
+		void* CreateEventW(void* attributes, int manualReset, int initialState, const(wchar)* name);
+		int SetEvent(void* event);
+		int ResetEvent(void* event);
+		int CloseHandle(void* handle);
+		uint WaitForSingleObject(void* handle, uint milliseconds);
+		uint WaitForMultipleObjects(uint count, const(void*)* handles, int all, uint milliseconds);
+		void Sleep(uint milliseconds);
+		ulong GetTickCount64();
+
+		struct SecHandle {
+			size_t lower, upper;
+		}
+
+		struct SecBuffer {
+			uint size;
+			uint type;
+			void* bytes;
+		}
+
+		struct SecBufferDesc {
+			uint version_;
+			uint count;
+			SecBuffer* buffers;
+		}
+
+		struct StreamSizes {
+			uint header, trailer, maximumMessage, buffers, blockSize;
+		}
+
+		struct CertContext {
+			uint encoding;
+			ubyte* encoded;
+			uint encodedLength;
+			void* info;
+			void* store;
+		}
+
+		// SCH_CREDENTIALS, which unlike SCHANNEL_CRED allows TLS 1.3.
+		struct SchCredentials {
+			uint version_ = 5;
+			uint format;
+			uint certificateCount;
+			const(CertContext*)* certificates;
+			void* rootStore;
+			uint mapperCount;
+			void** mappers;
+			uint sessionLifespan;
+			uint flags;
+			uint tlsParameterCount;
+			void* tlsParameters;
+		}
+
+		int AcquireCredentialsHandleW(const(wchar)* principal, const(wchar)* package_, uint use, void* logonId, void* authData, void* getKey, void* getKeyArgument, SecHandle* credentials, long* expiry);
+		int FreeCredentialsHandle(SecHandle* credentials);
+		int InitializeSecurityContextW(SecHandle* credentials, SecHandle* context, const(wchar)* target, uint requirements, uint reserved1, uint representation, SecBufferDesc* input, uint reserved2, SecHandle* newContext, SecBufferDesc* output, uint* attributes, long* expiry);
+		int AcceptSecurityContext(SecHandle* credentials, SecHandle* context, SecBufferDesc* input, uint requirements, uint representation, SecHandle* newContext, SecBufferDesc* output, uint* attributes, long* expiry);
+		int DeleteSecurityContext(SecHandle* context);
+		int FreeContextBuffer(void* buffer);
+		int QueryContextAttributesW(SecHandle* context, uint attribute, void* into);
+		int EncryptMessage(SecHandle* context, uint quality, SecBufferDesc* message, uint sequence);
+		int DecryptMessage(SecHandle* context, SecBufferDesc* message, uint sequence, uint* quality);
+
+		struct KeyUsage {
+			uint count;
+			const(char*)* identifiers;
+		}
+
+		struct UsageMatch {
+			uint type;
+			KeyUsage usage;
+		}
+
+		struct ChainPara {
+			uint size = ChainPara.sizeof;
+			UsageMatch usage;
+		}
+
+		struct SslPolicy {
+			uint size = SslPolicy.sizeof;
+			uint authType;
+			uint checks;
+			const(wchar)* serverName;
+		}
+
+		struct PolicyPara {
+			uint size = PolicyPara.sizeof;
+			uint flags;
+			void* extra;
+		}
+
+		struct PolicyStatus {
+			uint size = PolicyStatus.sizeof;
+			uint error;
+			int chainIndex;
+			int elementIndex;
+			void* extra;
+		}
+
+		int CertGetCertificateChain(void* engine, const(CertContext)* certificate, void* time, const(void)* store, const(ChainPara)* para, uint flags, void* reserved, const(void)** chain);
+		void CertFreeCertificateChain(const(void)* chain);
+		int CertVerifyCertificateChainPolicy(const(char)* policy, const(void)* chain, PolicyPara* para, PolicyStatus* status);
+		int CertFreeCertificateContext(const(CertContext)* certificate);
+	}
+
+	private enum size_t invalidSocket = ~cast(size_t) 0;
+	private enum int wsaeWouldBlock = 10035, fdRead = 0x1, fdWrite = 0x2, fdConnect = 0x10, fdClose = 0x20, fdConnectBit = 4;
+	private enum uint waitObject0 = 0, waitTimeout = 0x102, infinite = uint.max;
+	private enum int secOk = 0, secContinue = 0x00090312, secExpired = 0x00090317, secRenegotiate = 0x00090321, secIncomplete = cast(int) 0x80090318;
+	private enum uint secbufferEmpty = 0, secbufferData = 1, secbufferToken = 2, secbufferExtra = 5, secbufferTrailer = 6, secbufferHeader = 7;
+	private enum uint credOutbound = 2, attrStreamSizes = 4, attrRemoteCertificate = 0x53, authtypeServer = 2;
+	private enum uint schManualValidation = 0x8, schNoDefaultCredentials = 0x10;
+	// Replay and sequence detection, confidentiality, memory SSPI allocates, and a stream.
+	private enum uint iscRequirements = 0x4 | 0x8 | 0x10 | 0x100 | 0x8000, ascRequirements = 0x4 | 0x8 | 0x10 | 0x100 | 0x10000;
+	private static immutable wchar[] unisp = "Microsoft Unified Security Protocol Provider\0"w;
+
+	private long milliseconds() @trusted {
+		return cast(long) GetTickCount64();
+	}
+
+	private shared bool winsockStarted;
+
+	// Starts Winsock, once for the process; false if it cannot be.
+	private bool startWinsock() @trusted {
+		if (core.atomic.atomicLoad(winsockStarted)) return true;
+		ubyte[512] data = void;
+		if (WSAStartup(0x0202, data.ptr) != 0) return false;
+		core.atomic.atomicStore(winsockStarted, true);
+		return true;
+	}
+
+	// One TLS session run over buffers: records received wait in `records` until read, and what it writes goes where its caller says.
+	private struct Tls {
+		SecHandle context;
+		bool live; // `context` holds a session, to be deleted
+		bool done; // the handshake has finished, and not been reopened since
+		StreamSizes sizes;
+		char* records = null;
+		wchar* name = null; // the host the certificate must name; null for a server, or a connection without TLS
+		bool address; // `name` is an IP address, which is not sent as the server's name
+	}
+
+	private void end(ref Tls t) {
+		if (t.live) cast(void) DeleteSecurityContext(&t.context);
+		fp.dynarray.free(t.records);
+		fp.dynarray.free(t.name);
+		t = Tls.init;
+	}
+
+	private enum Shake : ubyte { done, more, failed, outOfMemory }
+
+	// Takes the handshake as far as `t.records` allows, appending output to `wire`; `reopened` calls SSPI even with nothing received, as post-handshake messages need.
+	private Shake handshake(ref Tls t, SecHandle* credentials, bool server, ref char* wire, bool reopened = false) @trusted {
+		if (reopened) t.done = false;
+		for (;;) {
+			immutable held = fp.dynarray.length(t.records);
+			if (held == 0 && (server || t.live) && !reopened) return Shake.more;
+			reopened = false;
+			SecBuffer[2] input = [SecBuffer(cast(uint) held, secbufferToken, t.records), SecBuffer(0, secbufferEmpty, null)];
+			SecBufferDesc inputs = {0, 2, input.ptr};
+			SecBuffer output = {0, secbufferToken, null};
+			SecBufferDesc outputs = {0, 1, &output};
+			uint attributes;
+			immutable status = server
+				? AcceptSecurityContext(credentials, t.live ? &t.context : null, &inputs, ascRequirements, 0, &t.context, &outputs, &attributes, null)
+				: InitializeSecurityContextW(credentials, t.live ? &t.context : null, t.address ? null : t.name, iscRequirements, 0, 0, t.live ? &inputs : null, 0, &t.context, &outputs, &attributes, null);
+			immutable kept = output.bytes is null || extend(wire, (cast(char*) output.bytes)[0 .. output.size]);
+			if (output.bytes !is null) cast(void) FreeContextBuffer(output.bytes);
+			if (status == secIncomplete) return Shake.more;
+			if (status != secOk && status != secContinue) return Shake.failed;
+			t.live = true;
+			if (!kept) return Shake.outOfMemory;
+			if (input[1].type == secbufferExtra) cast(void) fp.dynarray.deleteRange(t.records, 0, held - input[1].size);
+			else fp.dynarray.clear(t.records);
+			if (status == secOk) {
+				t.done = QueryContextAttributesW(&t.context, attrStreamSizes, &t.sizes) == secOk;
+				return t.done ? Shake.done : Shake.failed;
+			}
+		}
+	}
+
+	private enum Sealed : ubyte { ok, failed, outOfMemory }
+
+	// Encrypts `plain` into records appended to `wire`; on failure `wire` is as it was.
+	private Sealed seal(ref Tls t, const(char)[] plain, ref char* wire) @trusted {
+		immutable start = fp.dynarray.length(wire);
+		while (plain.length) {
+			immutable n = plain.length < t.sizes.maximumMessage ? plain.length : t.sizes.maximumMessage;
+			immutable at = fp.dynarray.length(wire), size = t.sizes.header + n + t.sizes.trailer;
+			if (fp.dynarray.grow(wire, size) is null) {
+				cast(void) fp.dynarray.popBackCount(wire, at - start);
+				return Sealed.outOfMemory;
+			}
+			auto record = wire + at;
+			core.stdc.string.memcpy(record + t.sizes.header, plain.ptr, n);
+			SecBuffer[4] parts = [SecBuffer(t.sizes.header, secbufferHeader, record), SecBuffer(cast(uint) n, secbufferData, record + t.sizes.header),
+				SecBuffer(t.sizes.trailer, secbufferTrailer, record + t.sizes.header + n), SecBuffer(0, secbufferEmpty, null)];
+			SecBufferDesc message = {0, 4, parts.ptr};
+			if (EncryptMessage(&t.context, 0, &message, 0) != secOk) {
+				cast(void) fp.dynarray.popBackCount(wire, at + size - start);
+				return Sealed.failed;
+			}
+			cast(void) fp.dynarray.popBackCount(wire, t.sizes.trailer - parts[2].size);
+			plain = plain[n .. $];
+		}
+		return Sealed.ok;
+	}
+
+	private enum Opened : ubyte { some, more, closed, reopened, failed, outOfMemory }
+
+	// Decrypts the first record `t.records` holds, appending what it carried to `plain`.
+	private Opened unseal(ref Tls t, ref char* plain) @trusted {
+		immutable held = fp.dynarray.length(t.records);
+		if (held == 0) return Opened.more;
+		SecBuffer[4] parts = [SecBuffer(cast(uint) held, secbufferData, t.records), SecBuffer.init, SecBuffer.init, SecBuffer.init];
+		SecBufferDesc message = {0, 4, parts.ptr};
+		immutable status = DecryptMessage(&t.context, &message, 0, null);
+		if (status == secIncomplete) return Opened.more;
+		if (status != secOk && status != secExpired && status != secRenegotiate) return Opened.failed;
+		size_t extra = 0;
+		foreach (ref p; parts) {
+			// Only a record SSPI decrypted carries data; on close_notify it leaves the input marked as data.
+			if (status == secOk && p.type == secbufferData && !extend(plain, (cast(char*) p.bytes)[0 .. p.size])) return Opened.outOfMemory;
+			if (p.type == secbufferExtra) extra = p.size;
+		}
+		cast(void) fp.dynarray.deleteRange(t.records, 0, held - extra);
+		return status == secExpired ? Opened.closed : status == secRenegotiate ? Opened.reopened : Opened.some;
+	}
+
+	private __gshared SecHandle tlsShared;
+	private __gshared bool tlsMade;
+	private __gshared bc.spinlock.SpinLock tlsLock;
+	private __gshared void* chainEngine; // null for the system's roots; the tests set one trusting only their own
+
+	// The credentials every https fetch shares, made on first use; null if SChannel could not make them.
+	private SecHandle* tlsCredentials() @trusted {
+		bc.spinlock.writeLock(tlsLock);
+		scope(exit) bc.spinlock.writeUnlock(tlsLock);
+		if (!tlsMade) {
+			bool failed = false;
+			version (unittest) failed = simulatedFailure();
+			SchCredentials c = {flags: schManualValidation | schNoDefaultCredentials};
+			if (failed || AcquireCredentialsHandleW(null, unisp.ptr, credOutbound, null, &c, null, null, &tlsShared, null) != secOk) return null;
+			tlsMade = true;
+		}
+		return &tlsShared;
+	}
+
+	// Whether the certificate the server presented chains to a trusted root and names `t.name`; SChannel leaves this to its caller, as the credentials ask.
+	private bool trusted(ref Tls t) @trusted {
+		const(CertContext)* certificate;
+		if (QueryContextAttributesW(&t.context, attrRemoteCertificate, &certificate) != secOk || certificate is null) return false;
+		scope(exit) cast(void) CertFreeCertificateContext(certificate);
+		const(char)* serverAuth = "1.3.6.1.5.5.7.3.1";
+		ChainPara para = {usage: UsageMatch(0, KeyUsage(1, &serverAuth))};
+		const(void)* chain;
+		if (!CertGetCertificateChain(chainEngine, certificate, null, certificate.store, &para, 0, null, &chain)) return false;
+		scope(exit) CertFreeCertificateChain(chain);
+		SslPolicy ssl = {authType: authtypeServer, serverName: t.name};
+		PolicyPara policy = {extra: &ssl};
+		PolicyStatus status;
+		enum sslPolicy = cast(const(char)*) 4;
+		return CertVerifyCertificateChainPolicy(sslPolicy, chain, &policy, &status) && status.error == 0;
+	}
+
+	// A host name being resolved on a thread of its own, which shares it; whichever side drops the last reference frees it.
+	private struct Lookup {
+		shared int references;
+		void* done; // an event the thread sets once `error` and `found` are
+		int error;
+		AddressInfo* found;
+		char[256] host = 0;
+		char[6] port = 0;
+	}
+
+	private void drop(Lookup* l) @trusted {
+		if (l is null || core.atomic.atomicOp!"-="(l.references, 1) != 0) return;
+		if (l.done !is null) cast(void) CloseHandle(l.done);
+		if (l.found !is null) freeaddrinfo(l.found);
+		core.stdc.stdlib.free(l);
+	}
+
+	private int lookUp(ref Lookup l, bool numeric) @trusted {
+		if (!startWinsock()) return -1;
+		AddressInfo hints;
+		hints.socketType = 1;
+		hints.flags = numeric ? 4 : 0;
+		return getaddrinfo(l.host.ptr, l.port.ptr, &hints, &l.found);
+	}
+
+	private void resolveOnThread(Lookup* l) @trusted {
+		l.error = lookUp(*l, false);
+		cast(void) SetEvent(l.done);
+		drop(l);
+	}
+
+	// Makes the event the resolving thread sets; false if it cannot.
+	private bool signalable(ref Lookup l) @trusted {
+		l.done = CreateEventW(null, true, false, null);
+		return l.done !is null;
+	}
+
+	// Closes the exchange's socket and the event that tells of it.
+	private void hangUp(ref Exchange e) @trusted {
+		if (e.fd != invalidSocket) cast(void) closesocket(e.fd);
+		e.fd = invalidSocket;
+		if (e.event !is null) cast(void) CloseHandle(e.event);
+		e.event = null;
+	}
+
+	private void disconnect(ref Exchange e) {
+		hangUp(e);
+		drop(e.lookup);
+		e.lookup = null;
+		e.next = null;
+		end(e.tls);
+		fp.dynarray.clear(e.wire);
+	}
+
+	// Moves a connected exchange on to its handshake or its request, done with the addresses it was trying.
+	private void connected(ref Exchange e) {
+		drop(e.lookup);
+		e.lookup = null;
+		e.next = null;
+		e.phase = e.tls.name !is null ? Phase.handshaking : Phase.sending;
+	}
+
+	// Starts connecting to the first address from `a` that takes a socket, remembering the rest; fails `f` if none does.
+	private void dial(ref Fetch f, AddressInfo* a) @trusted {
+		auto e = &f.exchange;
+		for (; a !is null; a = a.next) {
+			immutable s = socket(a.family, a.socketType, a.protocol);
+			if (s == invalidSocket) continue;
+			// Selecting events also makes the socket nonblocking.
+			bool failed = false;
+			version (unittest) failed = simulatedFailure();
+			auto event = failed ? null : CreateEventW(null, true, false, null);
+			if (event is null) {
+				cast(void) closesocket(s);
+				return fail(f, Failure.outOfMemory);
+			}
+			e.fd = s;
+			e.event = event;
+			if (WSAEventSelect(s, event, fdRead | fdWrite | fdConnect | fdClose) == 0) {
+				immutable at = connectSocket(s, a.address, cast(int) a.addressLength) == 0;
+				if (at || WSAGetLastError() == wsaeWouldBlock) {
+					e.next = a.next;
+					e.phase = Phase.connecting;
+					if (at) connected(*e);
+					return;
+				}
+			}
+			hangUp(*e);
+		}
+		fail(f, Failure.network);
+	}
+
+	// Sets up TLS for `host`, checking the certificate against it as a name or, when `address`, an IP address; fails `f` if it cannot.
+	private bool secure(ref Fetch f, const(char)* host, bool address) @trusted {
+		if (tlsCredentials() is null) {
+			fail(f, Failure.unsupported);
+			return false;
+		}
+		auto t = &f.exchange.tls;
+		t.name = fp.string.utf16(host[0 .. core.stdc.string.strlen(host)]);
+		if (t.name is null) {
+			fail(f, Failure.outOfMemory);
+			return false;
+		}
+		t.address = address;
+		return true;
+	}
+
+	// Sends what is left of the request, or of TLS's records; false until all is sent, having failed `f` if it cannot be.
+	private bool transmit(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		auto bytes = e.tls.name !is null ? e.wire : e.out_;
+		immutable total = fp.dynarray.length(bytes);
+		// Winsock takes a whole send, however large, while its buffer has any room, so sending in pieces keeps it from holding the whole request.
+		enum size_t piece = 1 << 16;
+		while (e.sent < total) {
+			immutable left = total - e.sent;
+			immutable wrote = send(e.fd, bytes + e.sent, cast(int) (left < piece ? left : piece), 0);
+			if (wrote < 0 && WSAGetLastError() == wsaeWouldBlock) return false;
+			if (wrote <= 0) {
+				fail(f, Failure.network);
+				return false;
+			}
+			e.sent += wrote;
+		}
+		if (e.tls.name !is null) {
+			fp.dynarray.clear(e.wire);
+			e.sent = 0;
+		}
+		return true;
+	}
+
+	// Has TLS seal the whole request into `wire`; false, having failed `f`, if it cannot.
+	private bool encrypt(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		bool failed = false;
+		version (unittest) failed = simulatedFailure();
+		immutable sealed = failed ? Sealed.failed : seal(e.tls, fp.dynarray.slice(e.out_), e.wire);
+		if (sealed == Sealed.ok) return true;
+		fail(f, sealed == Sealed.outOfMemory ? Failure.outOfMemory : Failure.network);
+		return false;
+	}
+
+	// Moves the bytes the socket has into TLS's records; on `Pulled.broken` it has failed `f`.
+	private Pulled pull(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		char[1 << 14] bytes = void;
+		immutable got = recv(e.fd, bytes.ptr, bytes.length, 0);
+		if (got < 0 && WSAGetLastError() == wsaeWouldBlock) return Pulled.later;
+		if (got == 0) return Pulled.end;
+		if (got < 0) {
+			fail(f, Failure.network);
+			return Pulled.broken;
+		}
+		if (!extend(e.tls.records, bytes[0 .. got])) {
+			fail(f, Failure.outOfMemory);
+			return Pulled.broken;
+		}
+		return Pulled.some;
+	}
+
+	// Runs the handshake further, sending what it writes; false, having failed `f` or waiting to send, unless it can go on.
+	private bool shake(ref Fetch f, ref Shake result, bool reopened = false) {
+		auto e = &f.exchange;
+		result = handshake(e.tls, &tlsShared, false, e.wire, reopened);
+		if (result == Shake.outOfMemory || result == Shake.failed) {
+			fail(f, result == Shake.failed ? Failure.network : Failure.outOfMemory);
+			return false;
+		}
+		return transmit(f);
+	}
+
+	private void advance(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		// Reset before trying anything, so whatever becomes ready from here on sets it again.
+		if (e.event !is null) cast(void) ResetEvent(e.event);
+		while (f.state == State.pending || f.state == State.head) {
+			final switch (e.phase) {
+			case Phase.resolving:
+				if (WaitForSingleObject(e.lookup.done, 0) != waitObject0) return;
+				if (e.lookup.error != 0) return fail(f, Failure.network);
+				dial(f, e.lookup.found);
+				break;
+			case Phase.connecting:
+				NetworkEvents happened;
+				if (WSAEnumNetworkEvents(e.fd, null, &happened) != 0) return fail(f, Failure.network);
+				if (!(happened.happened & fdConnect)) return;
+				if (happened.errors[fdConnectBit] != 0) {
+					hangUp(*e);
+					dial(f, e.next);
+					break;
+				}
+				connected(*e);
+				break;
+			case Phase.handshaking:
+				Shake result = Shake.done;
+				if (!(e.tls.done ? transmit(f) : shake(f, result))) return;
+				if (result == Shake.done) {
+					if (!trusted(e.tls)) return fail(f, Failure.network);
+					if (!encrypt(f)) return;
+					e.phase = Phase.sending;
+					break;
+				}
+				final switch (pull(f)) {
+				case Pulled.some:
+					break;
+				case Pulled.end:
+					return fail(f, Failure.network);
+				case Pulled.later, Pulled.broken:
+					return;
+				}
+				break;
+			case Phase.sending:
+				if (!transmit(f)) return;
+				e.phase = Phase.receiving;
+				break;
+			case Phase.receiving:
+				if (buffered(f) >= maxReady) return;
+				if (e.tls.name !is null) {
+					// A post-handshake message, such as a TLS 1.3 session ticket, reopens the handshake until SSPI has taken it.
+					auto opened = e.tls.done ? unseal(e.tls, e.in_) : Opened.more;
+					if (!e.tls.done || opened == Opened.reopened) {
+						Shake result;
+						if (!shake(f, result, opened == Opened.reopened) && f.state == State.failed) return;
+						if (result == Shake.done) continue;
+						opened = Opened.more;
+					}
+					final switch (opened) {
+					case Opened.some:
+						break;
+					case Opened.closed:
+						e.eof = true;
+						break;
+					case Opened.more:
+						final switch (pull(f)) {
+						case Pulled.some:
+							continue;
+						case Pulled.end:
+							e.eof = true;
+							break;
+						case Pulled.later, Pulled.broken:
+							return;
+						}
+						break;
+					case Opened.reopened:
+						assert(0);
+					case Opened.failed:
+						return fail(f, Failure.network);
+					case Opened.outOfMemory:
+						return fail(f, Failure.outOfMemory);
+					}
+				} else {
+					enum size_t chunk = 1 << 14;
+					immutable kept = fp.dynarray.length(e.in_);
+					if (fp.dynarray.grow(e.in_, chunk) is null) return fail(f, Failure.outOfMemory);
+					immutable got = recv(e.fd, e.in_ + kept, cast(int) chunk, 0);
+					cast(void) fp.dynarray.popBackCount(e.in_, chunk - (got > 0 ? got : 0));
+					if (got < 0 && WSAGetLastError() == wsaeWouldBlock) return;
+					if (got < 0) return fail(f, Failure.network);
+					if (got == 0) e.eof = true;
+				}
+				digest(f);
+				break;
+			}
+		}
+	}
+
+	private bool waitFor(Fetch*[] fs, int timeoutMs) @trusted {
+		static assert(maxWaited <= 64, "bc.http: WaitForMultipleObjects waits on at most 64 handles");
+		void*[maxWaited] handles;
+		foreach (i, f; fs) {
+			if ((f.state != State.pending && f.state != State.head) || buffered(*f)) return true;
+			handles[i] = f.exchange.phase == Phase.resolving ? f.exchange.lookup.done : f.exchange.event;
+		}
+		immutable limit = timeoutMs < 0 ? infinite : cast(uint) timeoutMs;
+		if (fs.length == 0) {
+			Sleep(limit);
+			return false;
+		}
+		return WaitForMultipleObjects(cast(uint) fs.length, handles.ptr, false, limit) != waitTimeout;
+	}
+}
+
 
 
 // --- fetching ----------------------------------------------------------------
@@ -1326,43 +1965,8 @@ unittest { // a wake hook can be set, is called with its context, and can be cle
 }
 
 version (WASI) {
-} else version (Posix) {
+} else {
 	version (unittest) {
-		static import core.sys.posix.netinet.in_;
-
-		// A one-thread loopback server for the tests: it answers each connection with the next of its responses, then closes it.
-		private struct Server {
-			int listener = -1;
-			int client = -1;
-			ushort port;
-			size_t served;
-			char* request = null; // the last request received, whole
-			char[64] url = 0;
-			SSL_CTX* tls; // for an https server, made by `listenTls`
-			SSL* session;
-			bool truncate; // hang up without TLS's close_notify, as a connection cut short does
-		}
-
-		// What a test https server needs of OpenSSL beyond what the client uses.
-		private extern (C) {
-			struct X509;
-			struct X509_STORE;
-			struct EVP_PKEY;
-			const(SSL_METHOD)* TLS_server_method();
-			BIO* BIO_new_mem_buf(const(void)* bytes, int length);
-			X509* PEM_read_bio_X509(BIO* bio, X509** into, void* password, void* context);
-			EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bio, EVP_PKEY** into, void* password, void* context);
-			void X509_free(X509* certificate);
-			void EVP_PKEY_free(EVP_PKEY* key);
-			int SSL_CTX_use_certificate(SSL_CTX* context, X509* certificate);
-			int SSL_CTX_use_PrivateKey(SSL_CTX* context, EVP_PKEY* key);
-			X509_STORE* SSL_CTX_get_cert_store(const(SSL_CTX)* context);
-			int X509_STORE_add_cert(X509_STORE* store, X509* certificate);
-			int SSL_set_fd(SSL* ssl, int fd);
-			void SSL_set_accept_state(SSL* ssl);
-			int SSL_shutdown(SSL* ssl);
-		}
-
 		// Self-signed certificates and their keys, valid until 2126; the tests trust `trustedPem` and `otherPem` but never `untrustedPem`.
 		private static immutable trustedPem = `-----BEGIN CERTIFICATE-----
 MIIBsDCCAVegAwIBAgIUXqarJNeDvR2AWY0ogQOJUhWMHG0wCgYIKoZIzj0EAwIw
@@ -1417,6 +2021,76 @@ v9P3aXc10vF/TGGje9Rm7rKiYFmhRANCAAQ6T+Pk1SWfBndZX7rjSq1bdUi8BUdd
 UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 -----END PRIVATE KEY-----
 `; // for other.test only
+
+		// `http://` or `https://`, then `host`, the port, and `path`, in `s.url`.
+		private const(char)[] address(ref Server s, const(char)[] path, const(char)[] host = "127.0.0.1") @trusted {
+			size_t n = 0;
+			foreach (c; s.tls !is null ? "https://" : "http://") s.url[n++] = c;
+			foreach (c; host) s.url[n++] = c;
+			s.url[n++] = ':';
+			char[5] digits;
+			size_t d = digits.length;
+			uint v = s.port;
+			do {
+				digits[--d] = cast(char) ('0' + v % 10);
+				v /= 10;
+			} while (v);
+			foreach (c; digits[d .. $]) s.url[n++] = c;
+			foreach (c; path) s.url[n++] = c;
+			return s.url[0 .. n];
+		}
+
+		// Steps the server and polls `f` in turn until `f` reaches `until` or stops.
+		private State drive(ref Server s, ref Fetch f, const(char[])[] responses, State until = State.done) {
+			Fetch*[1] fs = [&f];
+			foreach (_; 0 .. 10_000) {
+				step(s, responses);
+				immutable state = poll(f);
+				if (state >= until) return state;
+				cast(void) wait(fs[], 1);
+			}
+			assert(0, "drive: the fetch never got there");
+		}
+	}
+}
+
+version (WASI) {
+} else version (Posix) {
+	version (unittest) {
+		static import core.sys.posix.netinet.in_;
+
+		// A one-thread loopback server for the tests: it answers each connection with the next of its responses, then closes it.
+		private struct Server {
+			int listener = -1;
+			int client = -1;
+			ushort port;
+			size_t served;
+			char* request = null; // the last request received, whole
+			char[64] url = 0;
+			SSL_CTX* tls; // for an https server, made by `listenTls`
+			SSL* session;
+			bool truncate; // hang up without TLS's close_notify, as a connection cut short does
+		}
+
+		// What a test https server needs of OpenSSL beyond what the client uses.
+		private extern (C) {
+			struct X509;
+			struct X509_STORE;
+			struct EVP_PKEY;
+			const(SSL_METHOD)* TLS_server_method();
+			BIO* BIO_new_mem_buf(const(void)* bytes, int length);
+			X509* PEM_read_bio_X509(BIO* bio, X509** into, void* password, void* context);
+			EVP_PKEY* PEM_read_bio_PrivateKey(BIO* bio, EVP_PKEY** into, void* password, void* context);
+			void X509_free(X509* certificate);
+			void EVP_PKEY_free(EVP_PKEY* key);
+			int SSL_CTX_use_certificate(SSL_CTX* context, X509* certificate);
+			int SSL_CTX_use_PrivateKey(SSL_CTX* context, EVP_PKEY* key);
+			X509_STORE* SSL_CTX_get_cert_store(const(SSL_CTX)* context);
+			int X509_STORE_add_cert(X509_STORE* store, X509* certificate);
+			int SSL_set_fd(SSL* ssl, int fd);
+			void SSL_set_accept_state(SSL* ssl);
+			int SSL_shutdown(SSL* ssl);
+		}
 
 		private X509* certificate(const(char)[] pem) @trusted {
 			auto bio = BIO_new_mem_buf(pem.ptr, cast(int) pem.length);
@@ -1493,24 +2167,6 @@ UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 			if (s.tls !is null) SSL_CTX_free(s.tls);
 		}
 
-		// `http://` or `https://`, then `host`, the port, and `path`, in `s.url`.
-		private const(char)[] address(ref Server s, const(char)[] path, const(char)[] host = "127.0.0.1") @trusted {
-			size_t n = 0;
-			foreach (c; s.tls !is null ? "https://" : "http://") s.url[n++] = c;
-			foreach (c; host) s.url[n++] = c;
-			s.url[n++] = ':';
-			char[5] digits;
-			size_t d = digits.length;
-			uint v = s.port;
-			do {
-				digits[--d] = cast(char) ('0' + v % 10);
-				v /= 10;
-			} while (v);
-			foreach (c; digits[d .. $]) s.url[n++] = c;
-			foreach (c; path) s.url[n++] = c;
-			return s.url[0 .. n];
-		}
-
 		// Accepts, reads a whole request, and answers it with `responses[s.served]`, as far as it can without waiting.
 		private void step(ref Server s, const(char[])[] responses) @trusted {
 			if (s.client < 0) {
@@ -1585,18 +2241,457 @@ UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 			trusting = false;
 		}
 
-		// Steps the server and polls `f` in turn until `f` reaches `until` or stops.
-		private State drive(ref Server s, ref Fetch f, const(char[])[] responses, State until = State.done) {
-			Fetch*[1] fs = [&f];
-			foreach (_; 0 .. 10_000) {
-				step(s, responses);
-				immutable state = poll(f);
-				if (state >= until) return state;
-				cast(void) wait(fs[], 1);
-			}
-			assert(0, "drive: the fetch never got there");
+		// Whether `e` has sent its TLS client hello and waits on the server's answer.
+		private bool helloSent(ref const Exchange e) {
+			return e.phase == Phase.handshaking && e.events == core.sys.posix.poll.POLLIN;
+		}
+
+		// An address no socket connects to, too short to be one.
+		private core.sys.posix.netdb.addrinfo unusableAddress(ref ubyte[16] storage) @trusted {
+			core.sys.posix.netdb.addrinfo a = {ai_family: core.sys.posix.sys.socket.AF_INET, ai_socktype: core.sys.posix.sys.socket.SOCK_STREAM, ai_addr: cast(core.sys.posix.sys.socket.sockaddr*) storage.ptr, ai_addrlen: 1};
+			return a;
 		}
 	}
+}
+
+version (Windows) {
+	version (unittest) {
+		pragma(lib, "ncrypt");
+
+		// What the tests' loopback server needs beyond what the client uses.
+		private extern (Windows) {
+			struct PollFd {
+				size_t fd;
+				short events;
+				short revents;
+			}
+
+			struct Linger {
+				ushort onoff;
+				ushort linger;
+			}
+
+			struct NCryptBuffer {
+				uint size;
+				uint type;
+				void* bytes;
+			}
+
+			struct NCryptBufferDesc {
+				uint version_;
+				uint count;
+				NCryptBuffer* buffers;
+			}
+
+			struct KeyProviderInfo {
+				const(wchar)* container;
+				const(wchar)* provider;
+				uint providerType;
+				uint flags;
+				uint parameterCount;
+				void* parameters;
+				uint keySpec;
+			}
+
+			// CERT_CHAIN_ENGINE_CONFIG as of Windows 8, which added the exclusive root store.
+			struct EngineConfig {
+				uint size = EngineConfig.sizeof;
+				void* restrictedRoot, restrictedTrust, restrictedOther;
+				uint additionalStoreCount;
+				void** additionalStores;
+				uint flags, urlRetrievalTimeout, maximumCachedCertificates, cycleDetectionModulus;
+				void* exclusiveRoot, exclusiveTrustedPeople;
+				uint exclusiveFlags;
+			}
+
+			int bind(size_t s, const(void)* address, int length);
+			pragma(mangle, "listen") int listenOn(size_t s, int backlog);
+			size_t accept(size_t s, void* address, int* length);
+			int getsockname(size_t s, void* address, int* length);
+			int ioctlsocket(size_t s, int command, uint* argument);
+			int setsockopt(size_t s, int level, int option, const(void)* value, int length);
+			int WSAPoll(PollFd* fds, uint count, int timeout);
+			int ApplyControlToken(SecHandle* context, SecBufferDesc* input);
+
+			const(CertContext)* CertCreateCertificateContext(uint encoding, const(ubyte)* encoded, uint length);
+			int CertSetCertificateContextProperty(const(CertContext)* certificate, uint property, uint flags, const(void)* data);
+			void* CertOpenStore(const(char)* provider, uint encoding, size_t cryptProvider, uint flags, const(void)* parameter);
+			int CertCloseStore(void* store, uint flags);
+			int CertAddCertificateContextToStore(void* store, const(CertContext)* certificate, uint disposition, const(CertContext)** added);
+			int CertCreateCertificateChainEngine(EngineConfig* config, void** engine);
+			void CertFreeCertificateChainEngine(void* engine);
+
+			int NCryptOpenStorageProvider(size_t* provider, const(wchar)* name, uint flags);
+			int NCryptImportKey(size_t provider, size_t importKey, const(wchar)* blobType, NCryptBufferDesc* parameters, size_t* key, const(ubyte)* data, uint length, uint flags);
+			int NCryptFinalizeKey(size_t key, uint flags);
+			int NCryptDeleteKey(size_t key, uint flags);
+			int NCryptFreeObject(size_t handle);
+		}
+
+		private static immutable wchar[] keyStorage = "Microsoft Software Key Storage Provider\0"w;
+
+		// The https side of a test server; its key is stored under `name` because SChannel will not use one held only in memory.
+		private struct ServerTls {
+			SecHandle credentials;
+			const(CertContext)* certificate;
+			size_t provider, key;
+			wchar[32] name = 0;
+		}
+
+		// A one-thread loopback server for the tests: it answers each connection with the next of its responses, then closes it.
+		private struct Server {
+			size_t listener = invalidSocket;
+			size_t listener6 = invalidSocket; // the same port on ::1, as `localhost` may try that first, and a refused connection takes Windows seconds
+			size_t client = invalidSocket;
+			ushort port;
+			size_t served;
+			char* request = null; // the last request received, whole
+			char[64] url = 0;
+			ServerTls* tls; // for an https server, made by `listenTls`
+			Tls session;
+			char* wire = null; // records to send the client
+			bool truncate; // hang up without TLS's close_notify, as a connection cut short does
+			bool corrupt; // spoil the response's last record, so the client cannot decrypt it
+		}
+
+		// The DER bytes of the PEM block `label` names in `pem`, as a new fp dynarray.
+		private char* der(const(char)[] pem, const(char)[] label) @trusted {
+			static import fp.string;
+			char[64] begin = 0, end_ = 0;
+			size_t b = 0, e = 0;
+			foreach (c; "-----BEGIN ") begin[b++] = c;
+			foreach (c; "-----END ") end_[e++] = c;
+			foreach (c; label) {
+				begin[b++] = c;
+				end_[e++] = c;
+			}
+			foreach (c; "-----") {
+				begin[b++] = c;
+				end_[e++] = c;
+			}
+			immutable from = fp.string.find(pem, begin[0 .. b], 0), to = fp.string.find(pem, end_[0 .. e], 0);
+			assert(from != fp.pointer.notFound && to != fp.pointer.notFound);
+			char* bytes = null;
+			uint bits = 0, count = 0;
+			foreach (c; pem[from + b .. to]) {
+				int v = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52 : c == '+' ? 62 : c == '/' ? 63 : -1;
+				if (v < 0) continue;
+				bits = bits << 6 | v;
+				count += 6;
+				if (count >= 8) {
+					count -= 8;
+					assert(fp.dynarray.pushBack(bytes, cast(char) (bits >> count)));
+				}
+			}
+			return bytes;
+		}
+
+		private const(CertContext)* certificate(const(char)[] pem) @trusted {
+			auto bytes = der(pem, "CERTIFICATE");
+			scope(exit) fp.dynarray.free(bytes);
+			auto x = CertCreateCertificateContext(0x10001, cast(const(ubyte)*) bytes, cast(uint) fp.dynarray.length(bytes));
+			assert(x !is null);
+			return x;
+		}
+
+		private __gshared void* trustedRoots; // kept open as long as the engine trusting it
+
+		// Has every https fetch trust `trustedPem` and `otherPem`, and no other roots, as if a CA had issued them.
+		private void trustTestCertificates() @trusted {
+			if (chainEngine !is null) return;
+			enum memoryStore = cast(const(char)*) 2;
+			auto store = trustedRoots = CertOpenStore(memoryStore, 0, 0, 0, null);
+			assert(store !is null);
+			foreach (pem; [trustedPem, otherPem]) {
+				auto x = certificate(pem);
+				assert(CertAddCertificateContextToStore(store, x, 4, null));
+				cast(void) CertFreeCertificateContext(x);
+			}
+			EngineConfig config = {exclusiveRoot: store};
+			assert(CertCreateCertificateChainEngine(&config, &chainEngine));
+		}
+
+		// Drops the credentials https fetches share, and the tests' trust, so the next fetch makes them afresh.
+		private void forgetTls() {
+			if (tlsMade) cast(void) FreeCredentialsHandle(&tlsShared);
+			tlsMade = false;
+			if (chainEngine !is null) CertFreeCertificateChainEngine(chainEngine);
+			chainEngine = null;
+			if (trustedRoots !is null) cast(void) CertCloseStore(trustedRoots, 0);
+			trustedRoots = null;
+		}
+
+		private void nonblocking(size_t s) @trusted {
+			uint one = 1;
+			enum int fionbio = cast(int) 0x8004667E;
+			assert(ioctlsocket(s, fionbio, &one) == 0);
+		}
+
+		// A loopback http server, on port `first` if both 127.0.0.1 and ::1 have it free, else on one the system picks.
+		private Server listen(ushort first = 0) @trusted {
+			assert(startWinsock());
+			Server s;
+			foreach (attempt; 0 .. 16) {
+				s.listener = socket(2, 1, 0);
+				assert(s.listener != invalidSocket);
+				ubyte[16] a = 0;
+				a[0] = 2;
+				if (attempt == 0) {
+					a[2] = cast(ubyte) (first >> 8);
+					a[3] = cast(ubyte) first;
+				}
+				a[4] = 127;
+				a[7] = 1;
+				int size = a.length;
+				assert(bind(s.listener, a.ptr, a.length) == 0 && listenOn(s.listener, 8) == 0 && getsockname(s.listener, a.ptr, &size) == 0);
+				s.port = cast(ushort) (a[2] << 8 | a[3]);
+				s.listener6 = socket(23, 1, 0);
+				if (s.listener6 == invalidSocket) break;
+				ubyte[28] b = 0;
+				b[0] = 23;
+				b[2 .. 4] = a[2 .. 4];
+				b[23] = 1;
+				if (bind(s.listener6, b.ptr, b.length) == 0 && listenOn(s.listener6, 8) == 0) break;
+				// Something else holds the port on ::1, so try another.
+				cast(void) closesocket(s.listener);
+				cast(void) closesocket(s.listener6);
+				s.listener = s.listener6 = invalidSocket;
+			}
+			assert(s.listener != invalidSocket);
+			nonblocking(s.listener);
+			if (s.listener6 != invalidSocket) nonblocking(s.listener6);
+			// Room up front, so tests failing the client's allocations in turn never fail the server's instead.
+			assert(fp.dynarray.reserve(s.request, 1 << 16) !is null && fp.dynarray.reserve(s.session.records, 1 << 16) !is null && fp.dynarray.reserve(s.wire, 1 << 16) !is null);
+			return s;
+		}
+
+		private __gshared uint keysMade;
+
+		// A loopback https server presenting the certificate and key in `pem`.
+		private Server listenTls(const(char)[] pem) @trusted {
+			static import core.stdc.stdlib;
+			trustTestCertificates();
+			auto s = listen();
+			s.tls = cast(ServerTls*) core.stdc.stdlib.malloc(ServerTls.sizeof);
+			assert(s.tls !is null);
+			*s.tls = ServerTls.init;
+			auto t = s.tls;
+			t.certificate = certificate(pem);
+			size_t n = 0;
+			foreach (c; "bc-http-test-") t.name[n++] = c;
+			for (uint v = keysMade++; ; v /= 10) {
+				t.name[n++] = cast(wchar) ('0' + v % 10);
+				if (v < 10) break;
+			}
+			auto key = der(pem, "PRIVATE KEY");
+			scope(exit) fp.dynarray.free(key);
+			NCryptBuffer named = {cast(uint) ((n + 1) * wchar.sizeof), 45, t.name.ptr};
+			NCryptBufferDesc parameters = {0, 1, &named};
+			enum uint overwrite = 0x80, doNotFinalize = 0x400;
+			assert(NCryptOpenStorageProvider(&t.provider, keyStorage.ptr, 0) == 0);
+			assert(NCryptImportKey(t.provider, 0, "PKCS8_PRIVATEKEY"w.ptr, &parameters, &t.key, cast(const(ubyte)*) key, cast(uint) fp.dynarray.length(key), overwrite | doNotFinalize) == 0);
+			assert(NCryptFinalizeKey(t.key, 0) == 0);
+			KeyProviderInfo info = {container: t.name.ptr, provider: keyStorage.ptr};
+			enum uint keyProviderInfo = 2;
+			assert(CertSetCertificateContextProperty(t.certificate, keyProviderInfo, 0, &info));
+			SchCredentials c = {certificateCount: 1, certificates: &t.certificate};
+			enum uint credInbound = 1;
+			assert(AcquireCredentialsHandleW(null, unisp.ptr, credInbound, null, &c, null, null, &t.credentials, null) == secOk);
+			return s;
+		}
+
+		// Sends all of `bytes` to the client, waiting for room as it must; false if the client has gone.
+		private bool sendAll(ref Server s, const(char)[] bytes) @trusted {
+			while (bytes.length) {
+				immutable wrote = send(s.client, bytes.ptr, cast(int) bytes.length, 0);
+				if (wrote < 0 && WSAGetLastError() == wsaeWouldBlock) continue;
+				if (wrote <= 0) return false;
+				bytes = bytes[wrote .. $];
+			}
+			return true;
+		}
+
+		// Ends the connection to the client.
+		private void hangUp(ref Server s) @trusted {
+			if (s.tls !is null && s.session.done && !s.truncate) {
+				uint shutdown = 1;
+				SecBuffer token = {shutdown.sizeof, secbufferToken, &shutdown};
+				SecBufferDesc tokens = {0, 1, &token};
+				SecBuffer output = {0, secbufferToken, null};
+				SecBufferDesc outputs = {0, 1, &output};
+				uint attributes;
+				if (ApplyControlToken(&s.session.context, &tokens) == secOk) cast(void) AcceptSecurityContext(&s.tls.credentials, &s.session.context, null, ascRequirements, 0, &s.session.context, &outputs, &attributes, null);
+				if (output.bytes !is null) {
+					cast(void) sendAll(s, (cast(char*) output.bytes)[0 .. output.size]);
+					cast(void) FreeContextBuffer(output.bytes);
+				}
+			}
+			if (s.session.live) cast(void) DeleteSecurityContext(&s.session.context);
+			auto records = s.session.records;
+			fp.dynarray.clear(records);
+			s.session = Tls.init;
+			s.session.records = records;
+			fp.dynarray.clear(s.wire);
+			cast(void) closesocket(s.client);
+			s.client = invalidSocket;
+		}
+
+		private void close(ref Server s) @trusted {
+			static import core.stdc.stdlib;
+			if (s.client != invalidSocket) hangUp(s);
+			cast(void) closesocket(s.listener);
+			if (s.listener6 != invalidSocket) cast(void) closesocket(s.listener6);
+			fp.dynarray.free(s.request);
+			fp.dynarray.free(s.wire);
+			end(s.session);
+			if (s.tls !is null) {
+				cast(void) FreeCredentialsHandle(&s.tls.credentials);
+				cast(void) CertFreeCertificateContext(s.tls.certificate);
+				cast(void) NCryptDeleteKey(s.tls.key, 0);
+				cast(void) NCryptFreeObject(s.tls.provider);
+				core.stdc.stdlib.free(s.tls);
+			}
+		}
+
+		private size_t acceptEither(ref Server s) @trusted {
+			auto client = accept(s.listener, null, null);
+			if (client == invalidSocket && s.listener6 != invalidSocket) client = accept(s.listener6, null, null);
+			return client;
+		}
+
+		// Accepts, reads a whole request, and answers it with `responses[s.served]`, as far as it can without waiting.
+		private void step(ref Server s, const(char[])[] responses) @trusted {
+			if (s.client == invalidSocket) {
+				if (s.served == responses.length) return;
+				s.client = acceptEither(s);
+				if (s.client == invalidSocket) return;
+				fp.dynarray.clear(s.request);
+			}
+			char[4096] buffer;
+			immutable got = recv(s.client, buffer.ptr, buffer.length, 0);
+			if (s.tls !is null) {
+				if (got > 0) assert(extend(s.session.records, buffer[0 .. got]));
+				// The client hanging up, or refusing the handshake, as the tests of bad certificates expect.
+				bool gone = got == 0 || (got < 0 && WSAGetLastError() != wsaeWouldBlock);
+				if (!s.session.done) {
+					immutable shake = handshake(s.session, &s.tls.credentials, true, s.wire);
+					// A client refusing the certificate may hang up before the server's last handshake message, such as a session ticket.
+					gone = !sendAll(s, fp.dynarray.slice(s.wire)) || gone || shake == Shake.failed;
+					fp.dynarray.clear(s.wire);
+				}
+				for (Opened opened; !gone && s.session.done && (opened = unseal(s.session, s.request)) != Opened.more;) gone = opened != Opened.some;
+				if (gone) {
+					++s.served;
+					return hangUp(s);
+				}
+			} else if (got > 0) assert(fp.dynarray.concatenate(s.request, buffer[0 .. got]));
+			auto text = fp.dynarray.slice(s.request);
+			size_t end = 0;
+			while (end + 4 <= text.length && text[end .. end + 4] != "\r\n\r\n") ++end;
+			if (end + 4 > text.length) return;
+			size_t length = 0;
+			static immutable field = "\r\nContent-Length: ";
+			foreach (i; 0 .. end) if (i + field.length <= end && text[i .. i + field.length] == field)
+				for (size_t at = i + field.length; at < end && text[at] >= '0' && text[at] <= '9'; ++at) length = length * 10 + (text[at] - '0');
+			if (text.length < end + 4 + length) return;
+			const(char)[] response = responses[s.served++];
+			if (s.tls !is null) {
+				assert(seal(s.session, response, s.wire) == Sealed.ok);
+				if (s.corrupt) s.wire[fp.dynarray.length(s.wire) - 1] ^= 1;
+				response = fp.dynarray.slice(s.wire);
+			}
+			assert(sendAll(s, response));
+			hangUp(s);
+		}
+
+		// Accepts the connection the client has started, waiting for it.
+		private void acceptClient(ref Server s) @trusted {
+			enum short pollRead = 0x100;
+			PollFd[2] p = [PollFd(s.listener, pollRead), PollFd(s.listener6, pollRead)];
+			assert(WSAPoll(p.ptr, s.listener6 == invalidSocket ? 1 : 2, 5000) >= 1);
+			s.client = acceptEither(s);
+			assert(s.client != invalidSocket);
+		}
+
+		// Hangs up on the client, with a reset if `abruptly`, else having read what it sent, so the client sees its stream end.
+		private void cutOff(ref Server s, bool abruptly) @trusted {
+			if (abruptly) {
+				Linger l = {onoff: 1, linger: 0};
+				enum int solSocket = 0xFFFF, soLinger = 0x80;
+				assert(setsockopt(s.client, solSocket, soLinger, &l, l.sizeof) == 0);
+			} else {
+				char[4096] buffer;
+				while (recv(s.client, buffer.ptr, buffer.length, 0) > 0) {}
+			}
+			cast(void) closesocket(s.client);
+			s.client = invalidSocket;
+		}
+
+		// Whether `e` has sent its TLS client hello and waits on the server's answer.
+		private bool helloSent(ref const Exchange e) {
+			return e.phase == Phase.handshaking && fp.dynarray.length(e.wire) == 0;
+		}
+
+		// An address no socket connects to, too short to be one.
+		private AddressInfo unusableAddress(ref ubyte[16] storage) @trusted {
+			return AddressInfo(0, 2, 1, 0, 1, null, storage.ptr, null);
+		}
+	}
+
+	unittest { // SChannel's rarer turns: a record that will not seal or decrypt, a reopened handshake waiting on more, and the test server leaving a port ::1 holds
+		Tls t;
+		t.sizes.header = 5;
+		t.sizes.trailer = 16;
+		t.sizes.maximumMessage = 16;
+		char* wire = null;
+		scope(exit) fp.dynarray.free(wire);
+		assert(extend(wire, "kept"));
+		assert(seal(t, "plain", wire) == Sealed.failed && fp.dynarray.slice(wire) == "kept");
+
+		auto s = listenTls(trustedPem);
+		scope(exit) close(s);
+		static immutable responses = ["HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"];
+		s.corrupt = true;
+		Request r = {url: address(s, "/")};
+		auto f = start(r);
+		scope(exit) free(f.get);
+		assert(drive(s, f.get, responses) == State.failed && f.get.failure == Failure.network);
+
+		s.corrupt = false;
+		s.served = 0;
+		auto g = start(r);
+		scope(exit) free(g.get);
+		auto e = &g.get.exchange;
+		Fetch*[1] gs = [&g.get()];
+		while (e.phase != Phase.receiving) {
+			step(s, responses);
+			assert(poll(g.get) == State.pending);
+			cast(void) wait(gs[], 1);
+		}
+		// The server sends its session ticket only with the response, so the handshake reopened here has nothing to go on.
+		assert(e.tls.done && fp.dynarray.length(e.tls.records) == 0);
+		e.tls.done = false;
+		assert(poll(g.get) == State.pending && !e.tls.done);
+		e.tls.done = true;
+		assert(drive(s, g.get, responses) == State.done && readAll(g.get).get == "ok");
+
+		auto held = socket(23, 1, 0);
+		if (held == invalidSocket) return;
+		scope(exit) cast(void) closesocket(held);
+		ubyte[28] b = 0;
+		b[0] = 23;
+		b[23] = 1;
+		int size = b.length;
+		assert(bind(held, b.ptr, b.length) == 0 && getsockname(held, b.ptr, &size) == 0);
+		immutable taken = cast(ushort) (b[2] << 8 | b[3]);
+		auto moved = listen(taken);
+		scope(exit) close(moved);
+		assert(moved.port != taken && moved.listener6 != invalidSocket);
+	}
+}
+
+version (WASI) {
+} else {
 
 	unittest { // a GET and its response by length: the request sent, the status, fields and body, and the URL
 		static import fp.string;
@@ -1749,10 +2844,12 @@ UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 		scope(exit) free(h.get);
 		assert(h.get.state == State.failed && h.get.failure == Failure.network);
 
+		// Waiting on no fetches waits out the time.
+		assert(!wait(null, 1));
+
 		// An address no socket can connect to at all is passed over at once.
-		core.sys.posix.netinet.in_.sockaddr_in nowhere;
-		core.sys.posix.netdb.addrinfo unusable = {ai_family: core.sys.posix.sys.socket.AF_INET, ai_socktype: core.sys.posix.sys.socket.SOCK_STREAM,
-			ai_addr: cast(core.sys.posix.sys.socket.sockaddr*) &nowhere, ai_addrlen: 1};
+		ubyte[16] nowhere;
+		auto unusable = unusableAddress(nowhere);
 		Fetch d;
 		scope(exit) free(d);
 		dial(d, &unusable);
@@ -1776,7 +2873,8 @@ UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 			assert(poll(f.get) == State.pending);
 			cast(void) wait(fs[], 10);
 		}
-		assert(e.phase == Phase.sending && e.sent < fp.dynarray.length(e.out_) && e.events == core.sys.posix.poll.POLLOUT);
+		assert(e.phase == Phase.sending && e.sent < fp.dynarray.length(e.out_));
+		version (Posix) assert(e.events == core.sys.posix.poll.POLLOUT);
 		acceptClient(s);
 		cutOff(s, true);
 		while (poll(f.get) == State.pending) cast(void) wait(fs[], 10);
@@ -1862,7 +2960,7 @@ UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 		assert(state == State.failed && f.get.failure == Failure.outOfMemory);
 	}
 
-	unittest { // an https server hanging up mid-handshake, by reset or end of stream, fails the fetch; a body cut short without close_notify ends there
+	unittest { // an https server hanging up mid-handshake, by reset or end of stream, fails the fetch; a body ends with the stream, close_notify or not
 		foreach (abruptly; [false, true]) {
 			auto s = listenTls(trustedPem);
 			scope(exit) close(s);
@@ -1871,7 +2969,7 @@ UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 			scope(exit) free(f.get);
 			auto e = &f.get.exchange;
 			Fetch*[1] fs = [&f.get()];
-			while (e.phase != Phase.handshaking || e.events != core.sys.posix.poll.POLLIN) {
+			while (!helloSent(*e)) {
 				assert(poll(f.get) == State.pending);
 				cast(void) wait(fs[], 10);
 			}
@@ -1883,15 +2981,19 @@ UP+9cS5i1BreZ2RpGl/v9TimKp7olca0PrqZMNVoPAO2koyM5/TRKC5P
 
 		auto s = listenTls(trustedPem);
 		scope(exit) close(s);
-		s.truncate = true;
 		static immutable responses = ["HTTP/1.1 200 OK\r\n\r\nto the end", "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort"];
-		foreach (i; 0 .. responses.length) {
-			Request r = {url: address(s, "/")};
-			auto f = start(r);
-			scope(exit) free(f.get);
-			immutable state = drive(s, f.get, responses);
-			if (i == 0) assert(state == State.done && readAll(f.get).get == "to the end");
-			else assert(state == State.failed && f.get.failure == Failure.network);
+		// Ended by close_notify or not, a body read until the end is whole, and one shorter than its length is not.
+		foreach (truncate; [true, false]) {
+			s.truncate = truncate;
+			s.served = 0;
+			foreach (i; 0 .. responses.length) {
+				Request r = {url: address(s, "/")};
+				auto f = start(r);
+				scope(exit) free(f.get);
+				immutable state = drive(s, f.get, responses);
+				if (i == 0) assert(state == State.done && readAll(f.get).get == "to the end");
+				else assert(state == State.failed && f.get.failure == Failure.network);
+			}
 		}
 	}
 

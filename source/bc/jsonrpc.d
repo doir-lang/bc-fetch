@@ -2,29 +2,30 @@
 ///
 /// Examples:
 /// ---
-/// static import core.sys.posix.unistd;
-/// int[2] ends;
-/// assert(core.sys.posix.unistd.pipe(ends) == 0);
-/// assert(send(ends[1], `{"a":1}`));
-/// cast(void) core.sys.posix.unistd.close(ends[1]);
-/// Reader r = Reader(ends[0]);
+/// static import core.stdc.stdio;
+/// auto file = core.stdc.stdio.tmpfile();
+/// assert(file !is null);
+/// scope(exit) cast(void) core.stdc.stdio.fclose(file);
+/// immutable fd = core.stdc.stdio.fileno(file);
+/// assert(send(fd, `{"a":1}`));
+/// core.stdc.stdio.rewind(file);
+/// Reader r = Reader(fd);
 /// scope(exit) free(r);
 /// assert(next(r) == `{"a":1}` && next(r) is null && r.closed);
-/// cast(void) core.sys.posix.unistd.close(ends[0]);
 /// ---
 module bc.jsonrpc;
-
-static import core.stdc.errno;
-static import core.sys.posix.unistd;
 
 static import std.typecons;
 
 static import fp.dynarray;
+static import fp.file;
 
 @nogc nothrow:
 
 
-/// Reads framed messages from `fd`. Plain data, released by `free`; it does not close `fd`.
+// --- reading -----------------------------------------------------------------
+
+/// Reads framed messages from `fd`. Plain data, released by `free`; it does not close `fd`. On Windows, reading puts `fd` in binary mode, as `fp.file.readSome` does, so the C runtime does not translate line ends.
 struct Reader {
 	int fd; /// Where messages come from.
 	bool closed; /// Set once `fd` has ended or failed, or an allocation was refused.
@@ -133,25 +134,16 @@ const(char)[] next(ref Reader r) @trusted {
 			r.closed = true;
 			return null;
 		}
-		ptrdiff_t got;
-		do got = core.sys.posix.unistd.read(r.fd, r.buffer + kept, size);
-		while (got < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR);
+		immutable got = fp.file.readSome(r.fd, r.buffer[kept .. kept + size]);
 		cast(void) fp.dynarray.popBackCount(r.buffer, size - (got > 0 ? got : 0));
 		if (got <= 0) r.closed = true;
 	}
 }
 
-private bool writeAll(int fd, const(char)[] bytes) @trusted {
-	while (bytes.length) {
-		immutable wrote = core.sys.posix.unistd.write(fd, bytes.ptr, bytes.length);
-		if (wrote < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR) continue;
-		if (wrote <= 0) return false;
-		bytes = bytes[wrote .. $];
-	}
-	return true;
-}
 
-/// Writes `body` to `fd` as one message, its `Content-Length` header first.
+// --- writing -----------------------------------------------------------------
+
+/// Writes `body` to `fd` as one message, its `Content-Length` header first. On Windows it puts `fd` in binary mode first, as reading does.
 ///
 /// Returns false if `fd` fails, perhaps partway through the message.
 ///
@@ -170,7 +162,7 @@ bool send(int fd, const(char)[] body) {
 	} while (v);
 	while (n) header[at++] = digits[--n];
 	foreach (c; "\r\n\r\n") header[at++] = c;
-	return writeAll(fd, header[0 .. at]) && writeAll(fd, body);
+	return fp.file.writeAll(fd, header[0 .. at]) && fp.file.writeAll(fd, body);
 }
 
 
@@ -182,6 +174,23 @@ version (unittest) {
 		private extern (C) long lseek(int fd, long offset, int whence);
 	} else static import core.stdc.stdio;
 
+	version (Windows) {
+		private extern (C) {
+			int _setmode(int fd, int mode);
+			int _dup(int fd);
+			int _close(int fd);
+			int _lseek(int fd, int offset, int whence);
+		}
+	}
+
+	private void closeFd(int fd) @trusted {
+		version (Windows) cast(void) _close(fd);
+		else {
+			static import core.sys.posix.unistd;
+			cast(void) core.sys.posix.unistd.close(fd);
+		}
+	}
+
 	// A file to write messages into and read back: WASI preview 1 has neither pipes nor tmpfile.
 	private int scratch() @trusted {
 		version (WASI) return core.sys.posix.fcntl.open("/tmp/bc-jsonrpc-test", core.sys.posix.fcntl.O_RDWR | core.sys.posix.fcntl.O_CREAT | core.sys.posix.fcntl.O_TRUNC, 384);
@@ -189,23 +198,31 @@ version (unittest) {
 			auto file = core.stdc.stdio.tmpfile();
 			assert(file !is null);
 			scope(exit) cast(void) core.stdc.stdio.fclose(file);
-			return core.sys.posix.unistd.dup(core.stdc.stdio.fileno(file));
+			version (Windows) return _dup(core.stdc.stdio.fileno(file));
+			else {
+				static import core.sys.posix.unistd;
+				return core.sys.posix.unistd.dup(core.stdc.stdio.fileno(file));
+			}
 		}
 	}
 
 	// Moves `fd` back to its start, to read what was written.
 	private bool rewind(int fd) {
 		version (WASI) return lseek(fd, 0, 0) == 0;
-		else return core.sys.posix.unistd.lseek(fd, 0, 0) == 0;
+		else version (Windows) return _lseek(fd, 0, 0) == 0;
+		else {
+			static import core.sys.posix.unistd;
+			return core.sys.posix.unistd.lseek(fd, 0, 0) == 0;
+		}
 	}
 }
 
 unittest { // messages split across writes and run together come out whole and in order, and a header block without a length is skipped
 	immutable fd = scratch();
 	assert(fd >= 0);
-	scope(exit) cast(void) core.sys.posix.unistd.close(fd);
+	scope(exit) closeFd(fd);
 	static immutable stream = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}content-length:2\r\n\r\n[]X-Other: 1\r\n\r\nContent-Length: 0\r\n\r\n";
-	foreach (c; stream) assert(core.sys.posix.unistd.write(fd, &c, 1) == 1);
+	foreach (i; 0 .. stream.length) assert(fp.file.writeSome(fd, stream[i .. i + 1]) == 1);
 	assert(rewind(fd));
 	Reader r = Reader(fd);
 	scope(exit) free(r);
@@ -218,7 +235,7 @@ unittest { // messages split across writes and run together come out whole and i
 	// A message many reads long arrives whole, read into room made once its header is in.
 	immutable big = scratch();
 	assert(big >= 0);
-	scope(exit) cast(void) core.sys.posix.unistd.close(big);
+	scope(exit) closeFd(big);
 	enum size_t size = 3 << 20;
 	char* body = null;
 	scope(exit) fp.dynarray.free(body);
@@ -229,6 +246,20 @@ unittest { // messages split across writes and run together come out whole and i
 	scope(exit) free(large);
 	assert(next(large) == body[0 .. size]);
 	assert(fp.dynarray.capacity(large.buffer) < size + (1 << 17));
+
+	// A descriptor in text mode is switched to binary, so line ends in a body are neither added to nor taken away.
+	version (Windows) {
+		immutable text = scratch();
+		assert(text >= 0);
+		scope(exit) closeFd(text);
+		enum int textMode = 0x4000;
+		cast(void) _setmode(text, textMode);
+		assert(send(text, "a\r\nb\nc") && rewind(text));
+		cast(void) _setmode(text, textMode);
+		Reader translated = Reader(text);
+		scope(exit) free(translated);
+		assert(next(translated) == "a\r\nb\nc");
+	}
 
 	// No room to read into closes the reader.
 	static import fp.testing;
