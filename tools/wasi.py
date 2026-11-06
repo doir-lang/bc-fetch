@@ -18,8 +18,8 @@ compiler = os.environ.get('DC', 'ldc2')
 tests = os.path.join(out, 'bc-fetch-tests.wasm')
 reactor = os.path.join(out, 'bc-fetch-reactor.wasm')
 
-sdkVersion = '34'
-release = f'https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-{sdkVersion}/'
+sdk_version = '34'
+release = f'https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-{sdk_version}/'
 target = 'wasm32-wasip1'
 packages = ['@bjorn3/browser_wasi_shim@0.4.2']
 
@@ -38,7 +38,8 @@ def fetch(name):
 	return dest
 
 
-def importPaths():
+def import_paths():
+	"""Returns the import paths `dub describe` reports; exits with dub's output if it fails."""
 	result = subprocess.run(['dub', 'describe', '--import-paths', '--compiler=' + compiler], cwd=root, capture_output=True, text=True)
 	if result.returncode != 0:
 		sys.exit(result.stdout + result.stderr)
@@ -49,26 +50,27 @@ def link(name, wasm, sources, flags, startup, exports, paths, libs, builtins):
 	"""Compiles `sources` with `flags` into one object and links it with the startup file `startup`, exporting `exports`."""
 	compile = [compiler, '-mtriple=wasm32-unknown-wasi', '-betterC', '-checkaction=C', *flags, *('-I' + p for p in paths), '-od=' + out, *sources]
 	# The long-double archive replaces libc's printf, so it must come first; D's `real` is a 128-bit long double here.
-	linkArgs = [os.path.join(libs, startup), '-L' + libs, '-lc-printscan-long-double', '-lc', builtins, *('--export=' + e for e in exports)]
+	link_arguments = [os.path.join(libs, startup), '-L' + libs, '-lc-printscan-long-double', '-lc', builtins, *('--export=' + e for e in exports)]
 	# A reactor has no `_start`: the host calls `_initialize`, then its exports.
 	if '_initialize' in exports:
-		linkArgs.append('--no-entry')
+		link_arguments.append('--no-entry')
 	linker = os.environ.get('WASM_LD') or shutil.which('wasm-ld')
 	if linker:
 		obj = os.path.join(out, name + '.o')
 		subprocess.run([*compile, '-c', '-of=' + obj], cwd=root, check=True)
-		subprocess.run([linker, '-o', wasm, *linkArgs, obj], cwd=root, check=True)
+		subprocess.run([linker, '-o', wasm, *link_arguments, obj], cwd=root, check=True)
 	else:
-		subprocess.run([*compile, '--link-internally', '-of=' + wasm, *('-L' + a for a in linkArgs)], cwd=root, check=True)
+		subprocess.run([*compile, '--link-internally', '-of=' + wasm, *('-L' + a for a in link_arguments)], cwd=root, check=True)
 
 
 def build():
-	sysroot = os.environ.get('WASI_SYSROOT') or fetch(f'wasi-sysroot-{sdkVersion}.0')
+	"""Builds the wasm test binary into bin/wasi and copies the page scripts beside it."""
+	sysroot = os.environ.get('WASI_SYSROOT') or fetch(f'wasi-sysroot-{sdk_version}.0')
 	builtins = os.environ.get('WASI_BUILTINS') or os.path.join(
-		fetch(f'libclang_rt-{sdkVersion}.0'), 'wasm32-unknown-wasip1', 'libclang_rt.builtins.a')
+		fetch(f'libclang_rt-{sdk_version}.0'), 'wasm32-unknown-wasip1', 'libclang_rt.builtins.a')
 	libs = os.path.join(sysroot, 'lib', target)
 
-	paths = importPaths()
+	paths = import_paths()
 	sources = sorted(glob.glob(os.path.join(root, 'source', 'bc', '**', '*.d'), recursive=True))
 	# Import paths outside the root are libfp's, whose modules must be compiled in too, or they would not link.
 	dependencies = sorted(f for p in paths if os.path.commonpath([root, os.path.abspath(p)]) != root
@@ -101,14 +103,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 		super().__init__(*args, directory=out, **kwargs)
 
 	def end_headers(self):
+		"""Adds the cross-origin isolation headers, then ends the header block."""
 		self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
 		self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
 		super().end_headers()
 
 	def log_message(self, *args):
-		pass
+		"""Logs nothing, keeping the tests' output readable."""
 
 	def respond(self, status, body=b'', headers=()):
+		"""Sends a complete response: `status`, `headers`, a Content-Length and `body`."""
 		self.send_response(status)
 		for name, value in headers:
 			self.send_header(name, value)
@@ -147,10 +151,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 		return True
 
 	def do_GET(self):
+		"""Answers a test route, or serves bin/wasi."""
 		if not self.route():
 			super().do_GET()
 
 	def do_POST(self):
+		"""Answers a test route, or 404."""
 		if not self.route():
 			self.respond(404)
 
@@ -164,6 +170,7 @@ def serve(port):
 
 
 def main():
+	"""Parses the command line, builds, then serves or runs the tests as asked."""
 	parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
 	mode = parser.add_mutually_exclusive_group()
 	mode.add_argument('--node', action='store_true', help='run the tests under Node')

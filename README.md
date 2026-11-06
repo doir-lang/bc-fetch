@@ -2,9 +2,11 @@
 
 HTTP, JSON and JSON-RPC for `-betterC` D, which has no Phobos, on [libfp](https://github.com/doir-lang/libfp), for native targets and `wasm32-wasi` alike.
 
-- `bc.json` — editable documents: minified JSON text with an index of its values, so finding a member or an element allocates nothing. `parse` reads one, `set`, `append`, `insert`, `replace` and `remove` edit it in place, `json` gives its text and `pretty` lays it out; a `Value` names one value, `v["key"][0]`, and stays valid across edits.
+- `bc.json` — editable documents: minified JSON text with an index of its values, so finding a member or an element allocates nothing.
+  `parse` reads one, `set`, `append`, `insert`, `replace` and `remove` edit it in place, `json` gives its text and `pretty` lays it out; a `Value` names one value, `v["key"][0]`, and stays valid across edits.
 - `bc.jsonrpc` — JSON-RPC messages framed by `Content-Length` headers over file descriptors, as Language Server Protocol clients speak over a server's stdin and stdout; on Windows these are C runtime descriptors, put in binary mode.
-- `bc.http` — an HTTP client shaped like fetch: `start` a `Request` without blocking, then `poll` and `readBody` as the response arrives, or block with `fetch` and `readAll`. Natively it speaks HTTP/1.1 over sockets, with OpenSSL for `https` (SChannel on Windows) and host names resolved on a thread; on `wasm32-wasi` it calls the host's fetch through [js/bc-fetch.mjs](js/bc-fetch.mjs).
+- `bc.http` — an HTTP client shaped like fetch: `start` a `Request` without blocking, then `poll` and `readBody` as the response arrives, or block with `fetch` and `readAll`.
+  Natively it speaks HTTP/1.1 over sockets, with OpenSSL for `https` (SChannel on Windows) and host names resolved on a thread; on `wasm32-wasi` it calls the host's fetch through [js/bc-fetch.mjs](js/bc-fetch.mjs).
 - `bc.http.message` — HTTP/1.1 without I/O: parse URLs, write request heads, and read response heads and bodies, `chunked` included, from bytes already received.
 
 Call these modules' functions fully qualified, as in `bc.json.parse(text)` or `bc.http.free(f)`: several define `free`.

@@ -22,27 +22,16 @@ static import core.stdc.string;
 
 static import std.typecons;
 
+static import fp.pointer;
+static import fp.string;
+static import fp.string.ascii;
+static import fp.string.numbers;
 static import fp.dynarray;
 
 @nogc nothrow:
 
 
 // --- names -------------------------------------------------------------------
-
-/// Whether `a` and `b` are the same ASCII text ignoring case, as header names and URL schemes compare.
-///
-/// Examples:
-/// ---
-/// assert(sameName("Content-Length", "content-length") && !sameName("Host", "Hosts"));
-/// ---
-bool sameName(const(char)[] a, const(char)[] b) {
-	if (a.length != b.length) return false;
-	foreach (i, c; a) {
-		immutable d = b[i];
-		if ((c >= 'A' && c <= 'Z' ? c + 32 : c) != (d >= 'A' && d <= 'Z' ? d + 32 : d)) return false;
-	}
-	return true;
-}
 
 private bool tokenChar(char c) {
 	if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return true;
@@ -136,14 +125,10 @@ std.typecons.Nullable!Url parseUrl(const(char)[] text) {
 	}
 	if (u.host.length == 0) return none;
 	if (port.length) {
-		uint n = 0;
-		foreach (c; port) {
-			if (c < '0' || c > '9') return none;
-			n = n * 10 + (c - '0');
-			if (n > ushort.max) return none;
-		}
-		u.port = cast(ushort) n;
-	} else u.port = sameName(u.scheme, "http") ? 80 : sameName(u.scheme, "https") ? 443 : 0;
+		auto n = fp.string.numbers.parseUnsigned(port);
+		if (n.isNull || n.get.value > ushort.max) return none;
+		u.port = cast(ushort) n.get.value;
+	} else u.port = fp.string.ascii.equalIgnoringCase(u.scheme, "http") ? 80 : fp.string.ascii.equalIgnoringCase(u.scheme, "https") ? 443 : 0;
 	return typeof(return)(u);
 }
 
@@ -151,20 +136,6 @@ std.typecons.Nullable!Url parseUrl(const(char)[] text) {
 // --- writing requests --------------------------------------------------------
 
 // Appends every piece to `out_`, or nothing if it cannot grow.
-private bool put(ref char* out_, const(char)[][] pieces...) @trusted {
-	size_t total = 0;
-	foreach (p; pieces) total += p.length;
-	if (total == 0) return true;
-	immutable at = fp.dynarray.length(out_);
-	if (fp.dynarray.grow(out_, total) is null) return false;
-	size_t k = at;
-	foreach (p; pieces) {
-		core.stdc.string.memcpy(out_ + k, p.ptr, p.length);
-		k += p.length;
-	}
-	return true;
-}
-
 /// Appends the request line `method target HTTP/1.1` to the fp dynarray `out_`, writing `target` as `/` when it is empty and putting `/` before it when it starts with `?`. It does not check `method` or `target`; `parseUrl` already refuses a target that would break the line.
 ///
 /// Returns false if `out_` could not grow, leaving it as it was.
@@ -178,9 +149,10 @@ private bool put(ref char* out_, const(char)[][] pieces...) @trusted {
 /// assert(fp.dynarray.slice(out_) == "POST /?q HTTP/1.1\r\n");
 /// ---
 bool writeRequestLine(ref char* out_, const(char)[] method, const(char)[] target) {
-	return put(out_, method, " ", target.length == 0 || target[0] == '?' ? "/" : "", target, " HTTP/1.1\r\n");
+	return fp.string.append(out_, method, " ", target.length == 0 || target[0] == '?' ? "/" : "", target, " HTTP/1.1\r\n");
 }
 
+// wrapper: names an HTTP head's format, or the struct over its fields
 /// Appends the field `name: value` to the fp dynarray `out_`. It does not check them; see `validName` and `validValue`.
 ///
 /// Returns false if `out_` could not grow, leaving it as it was.
@@ -194,9 +166,10 @@ bool writeRequestLine(ref char* out_, const(char)[] method, const(char)[] target
 /// assert(fp.dynarray.slice(out_) == "Accept: */*\r\n");
 /// ---
 bool writeField(ref char* out_, const(char)[] name, const(char)[] value) {
-	return put(out_, name, ": ", value, "\r\n");
+	return fp.string.append(out_, name, ": ", value, "\r\n");
 }
 
+// wrapper: names an HTTP head's format, or the struct over its fields
 /// Appends the blank line that ends a head to the fp dynarray `out_`; the body, if any, follows it.
 ///
 /// Returns false if `out_` could not grow, leaving it as it was.
@@ -209,7 +182,7 @@ bool writeField(ref char* out_, const(char)[] name, const(char)[] value) {
 /// assert(endHead(out_) && fp.dynarray.slice(out_) == "\r\n");
 /// ---
 bool endHead(ref char* out_) {
-	return put(out_, "\r\n");
+	return fp.string.append(out_, "\r\n");
 }
 
 
@@ -248,10 +221,7 @@ struct Head {
 private Header field(const(char)[] line) {
 	size_t colon = 0;
 	while (line[colon] != ':') ++colon;
-	auto value = line[colon + 1 .. $];
-	while (value.length && (value[0] == ' ' || value[0] == '\t')) value = value[1 .. $];
-	while (value.length && (value[$ - 1] == ' ' || value[$ - 1] == '\t')) value = value[0 .. $ - 1];
-	return Header(line[0 .. colon], value);
+	return Header(line[0 .. colon], fp.string.trim(line[colon + 1 .. $], " \t"));
 }
 
 /// The field lines of a head, as a range of `Header`s in the order they arrived.
@@ -295,6 +265,7 @@ struct Fields {
 	}
 }
 
+// wrapper: names an HTTP head's format, or the struct over its fields
 /// The fields of `h`, as a range of `Header`s.
 ///
 /// Examples:
@@ -339,12 +310,10 @@ Head parseHead(const(char)[] bytes, const(char)[] method) {
 	if (bytes[lineEnd + 1] != '\n') return h;
 	auto line = bytes[0 .. lineEnd];
 	if (line.length < 12 || line[0 .. 7] != "HTTP/1." || line[7] < '0' || line[7] > '9' || line[8] != ' ' || (line.length > 12 && line[12] != ' ')) return h;
-	uint status = 0;
-	foreach (c; line[9 .. 12]) {
-		if (c < '0' || c > '9') return h;
-		status = status * 10 + (c - '0');
-	}
-	h.status = cast(ushort) status;
+	auto parsedStatus = fp.string.numbers.parseUnsigned(line[9 .. 12]);
+	if (parsedStatus.isNull) return h;
+	immutable status = cast(ushort) parsedStatus.get.value;
+	h.status = status;
 	h.reason = line.length > 12 ? line[13 .. $] : null;
 	h.fields = lineEnd == end ? null : bytes[lineEnd + 2 .. end + 2];
 	h.size = end + 4;
@@ -361,29 +330,21 @@ Head parseHead(const(char)[] bytes, const(char)[] method) {
 		while (colon < text.length && text[colon] != ':') ++colon;
 		if (colon == text.length || !validName(text[0 .. colon]) || !validValue(text[colon + 1 .. $])) return h;
 		auto f = field(text);
-		if (sameName(f.name, "transfer-encoding")) {
+		if (fp.string.ascii.equalIgnoringCase(f.name, "transfer-encoding")) {
 			coded = true;
-			auto last = f.value;
-			foreach_reverse (i, c; last) if (c == ',') {
-				last = last[i + 1 .. $];
-				break;
-			}
-			while (last.length && (last[0] == ' ' || last[0] == '\t')) last = last[1 .. $];
-			chunked = sameName(last, "chunked");
-		} else if (sameName(f.name, "content-length")) {
-			if (f.value.length == 0) return h;
-			ulong n = 0;
-			foreach (c; f.value) {
-				if (c < '0' || c > '9' || n > (ulong.max - 9) / 10) return h;
-				n = n * 10 + (c - '0');
-			}
-			if (sized && n != length) return h;
+			// The last coding applied decides whether the body is chunked.
+			immutable comma = fp.string.findLast(f.value, ',');
+			const last = comma == fp.pointer.notFound ? f.value : f.value[comma + 1 .. $];
+			chunked = fp.string.ascii.equalIgnoringCase(fp.string.trimStart(last, " \t"), "chunked");
+		} else if (fp.string.ascii.equalIgnoringCase(f.name, "content-length")) {
+			auto n = fp.string.numbers.parseUnsigned(f.value);
+			if (n.isNull || (sized && n.get.value != length)) return h;
 			sized = true;
-			length = n;
+			length = n.get.value;
 		}
 	}
 
-	if (sameName(method, "HEAD") || (status >= 100 && status < 200) || status == 204 || status == 304) h.framing = Framing.none;
+	if (fp.string.ascii.equalIgnoringCase(method, "HEAD") || (status >= 100 && status < 200) || status == 204 || status == 304) h.framing = Framing.none;
 	else if (coded) h.framing = chunked ? Framing.chunked : Framing.close;
 	else if (sized) {
 		h.framing = Framing.length;
@@ -489,21 +450,12 @@ Decoded decode(ref Body b, char[] bytes) @trusted {
 				if (line.length == 0) b.step = Step.done;
 				break;
 			}
-			ulong size = 0;
 			size_t digits = 0;
-			for (; digits < line.length; ++digits) {
-				immutable c = line[digits];
-				uint v;
-				if (c >= '0' && c <= '9') v = c - '0';
-				else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
-				else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
-				else break;
-				if (size >> 60) goto broken;
-				size = size << 4 | v;
-			}
-			if (digits == 0 || (digits < line.length && line[digits] != ';' && line[digits] != ' ' && line[digits] != '\t')) goto broken;
-			b.remaining = size;
-			b.step = size ? Step.data : Step.trailer;
+			while (digits < line.length && fp.string.ascii.isHexDigit(line[digits])) ++digits;
+			auto size = fp.string.numbers.parseUnsigned(line[0 .. digits], 16);
+			if (size.isNull || (digits < line.length && line[digits] != ';' && line[digits] != ' ' && line[digits] != '\t')) goto broken;
+			b.remaining = size.get.value;
+			b.step = b.remaining ? Step.data : Step.trailer;
 			break;
 		case Step.data:
 			immutable n = b.remaining < bytes.length - i ? cast(size_t) b.remaining : bytes.length - i;
@@ -568,7 +520,7 @@ version(unittest) {
 }
 
 unittest { // names and URLs: case-insensitive names, field validity, and every URL part with its defaults and refusals
-	assert(sameName("", "") && !sameName("a", "b") && sameName("ETAG", "etag"));
+	assert(fp.string.ascii.equalIgnoringCase("", "") && !fp.string.ascii.equalIgnoringCase("a", "b") && fp.string.ascii.equalIgnoringCase("ETAG", "etag"));
 	assert(validName("a") && !validName("a:b") && !validName("é"));
 	assert(validValue("") && validValue("a\tb") && !validValue("a\nb") && !validValue("\x7f"));
 
@@ -591,9 +543,9 @@ unittest { // writing requests appends whole lines, and leaves the buffer as it 
 	assert(writeRequestLine(out_, "GET", "") && writeField(out_, "Host", "h") && endHead(out_));
 	assert(fp.dynarray.slice(out_) == "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
 	immutable before = fp.dynarray.length(out_);
-	auto previous = fp.testing.beginRationedAllocator(0);
+	auto previous = fp.testing.limitAllocations(0);
 	assert(!writeField(out_, "Long", "value that cannot fit in what the array has left"));
-	fp.testing.endRationedAllocator(previous);
+	fp.testing.restoreAllocator(previous);
 	assert(fp.dynarray.length(out_) == before);
 }
 
