@@ -132,6 +132,35 @@ std.typecons.Nullable!Url parseUrl(const(char)[] text) {
 	return typeof(return)(u);
 }
 
+/// `text` as a new fp string with each `%` and two hexadecimal digits replaced by the byte they name, as a URL or a `file://` URI writes the characters it reserves; a `%` not followed by two hexadecimal digits is kept as written. An empty `text` gives null.
+///
+/// Returns an empty `Nullable` if an allocation was refused.
+///
+/// Examples:
+/// ---
+/// static import fp.string;
+/// auto decoded = percentDecoded("/a%20b%2Fc%2g").get;
+/// scope(exit) fp.string.free(decoded);
+/// assert(fp.string.slice(decoded) == "/a b/c%2g");
+/// ---
+std.typecons.Nullable!(char*) percentDecoded(const(char)[] text) {
+	char* out_ = null;
+	for (size_t i = 0; i < text.length;) {
+		char c = text[i];
+		size_t step = 1;
+		if (c == '%' && i + 2 < text.length && fp.string.ascii.isHexDigit(text[i + 1]) && fp.string.ascii.isHexDigit(text[i + 2])) {
+			c = cast(char) (fp.string.numbers.hexDigitValue(text[i + 1]) * 16 + fp.string.numbers.hexDigitValue(text[i + 2]));
+			step = 3;
+		}
+		if (!fp.string.append(out_, c)) {
+			fp.string.free(out_);
+			return typeof(return).init;
+		}
+		i += step;
+	}
+	return typeof(return)(out_);
+}
+
 
 // --- writing requests --------------------------------------------------------
 
@@ -534,6 +563,19 @@ unittest { // names and URLs: case-insensitive names, field validity, and every 
 	assert(parseUrl("http://").isNull && parseUrl("http://:80/").isNull && parseUrl("http://h:65536").isNull);
 	assert(parseUrl("http://h:8x").isNull && parseUrl("http://[::1/").isNull && parseUrl("http://[::1]x").isNull);
 	assert(parseUrl("http://h/a b").isNull && parseUrl("http://h/\r\n").isNull && parseUrl("1http://h").isNull && parseUrl("").isNull);
+
+	static import fp.testing;
+	static immutable string[2][4] encoded = [["/odd%2g%2", "/odd%2g%2"], ["%41%62%", "Ab%"], ["%e2%82%AC", "€"], ["plain", "plain"]];
+	foreach (pair; encoded) {
+		auto decoded = percentDecoded(pair[0]).get;
+		scope(exit) fp.string.free(decoded);
+		assert(fp.string.slice(decoded) == pair[1]);
+	}
+	assert(!percentDecoded("").isNull && percentDecoded("").get is null);
+	auto previous = fp.testing.limitAllocations(0);
+	auto refused = percentDecoded("x");
+	fp.testing.restoreAllocator(previous);
+	assert(refused.isNull);
 }
 
 unittest { // writing requests appends whole lines, and leaves the buffer as it was when growth is refused

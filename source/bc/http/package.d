@@ -3041,7 +3041,7 @@ version (WASI) {
 		Request r = {url: address(url, "/hello")};
 		auto f = fetch(r);
 		scope(exit) free(f.get);
-		assert(f.get.state >= State.head && f.get.status == 200 && get(f.get.headers, "Content-Type").get == "text/plain");
+		assert(f.get.state >= State.head && f.get.status == 200 && get(f.get.headers, "Content-Type").get.value == "text/plain");
 		assert(readAll(f.get).get.content == "hello" && fp.string.endsWith(f.get.url, "/hello"));
 
 		Request p = {url: address(url, "/echo"), method: "post", body: "data"};
@@ -3092,7 +3092,7 @@ version (WASI) {
 		auto m = fetch(manual);
 		scope(exit) free(m.get);
 		// Node hands over the redirect itself; a browser hides it, as `Redirect.manual` says.
-		assert(m.get.status == 302 ? get(m.get.headers, "location").get == "/hello" : m.get.status == 0 && length(m.get.headers) == 0);
+		assert(m.get.status == 302 ? get(m.get.headers, "location").get.value == "/hello" : m.get.status == 0 && length(m.get.headers) == 0);
 	}
 
 	unittest { // a timeout fails a fetch the server never answers, an abort stops one, and a refused connection fails

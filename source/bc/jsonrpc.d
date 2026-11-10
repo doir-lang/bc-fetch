@@ -170,16 +170,7 @@ version (unittest) {
 		private extern (C) {
 			int _setmode(int fd, int mode);
 			int _dup(int fd);
-			int _close(int fd);
 			int _lseek(int fd, int offset, int whence);
-		}
-	}
-
-	private void closeFd(int fd) @trusted {
-		version (Windows) cast(void) _close(fd);
-		else {
-			static import core.sys.posix.unistd;
-			cast(void) core.sys.posix.unistd.close(fd);
 		}
 	}
 
@@ -212,7 +203,7 @@ version (unittest) {
 unittest { // messages split across writes and run together come out whole and in order, and a header block without a length is skipped
 	immutable fd = scratch();
 	assert(fd >= 0);
-	scope(exit) closeFd(fd);
+	scope(exit) cast(void) fp.io.close(fd);
 	static immutable stream = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}content-length:2\r\n\r\n[]X-Other: 1\r\n\r\nContent-Length: 0\r\n\r\n";
 	foreach (i; 0 .. stream.length) assert(fp.io.writeSome(fd, stream[i .. i + 1]) == 1);
 	assert(rewind(fd));
@@ -227,7 +218,7 @@ unittest { // messages split across writes and run together come out whole and i
 	// A message many reads long arrives whole, read into room made once its header is in.
 	immutable big = scratch();
 	assert(big >= 0);
-	scope(exit) closeFd(big);
+	scope(exit) cast(void) fp.io.close(big);
 	enum size_t size = 3 << 20;
 	char* body = null;
 	scope(exit) fp.dynarray.free(body);
@@ -243,7 +234,7 @@ unittest { // messages split across writes and run together come out whole and i
 	version (Windows) {
 		immutable text = scratch();
 		assert(text >= 0);
-		scope(exit) closeFd(text);
+		scope(exit) cast(void) fp.io.close(text);
 		enum int textMode = 0x4000;
 		cast(void) _setmode(text, textMode);
 		assert(send(text, "a\r\nb\nc") && rewind(text));
