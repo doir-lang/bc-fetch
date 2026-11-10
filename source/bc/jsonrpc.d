@@ -21,14 +21,14 @@ static import fp.string;
 static import fp.string.ascii;
 static import fp.string.numbers;
 static import fp.dynarray;
-static import fp.file;
+static import fp.io;
 
 @nogc nothrow:
 
 
 // --- reading -----------------------------------------------------------------
 
-/// Reads framed messages from `fd`. Plain data, released by `free`; it does not close `fd`. On Windows, reading puts `fd` in binary mode, as `fp.file.readSome` does, so the C runtime does not translate line ends.
+/// Reads framed messages from `fd`. Plain data, released by `free`; it does not close `fd`. On Windows, reading puts `fd` in binary mode, as `fp.io.readSome` does, so the C runtime does not translate line ends.
 struct Reader {
 	int fd; /// Where messages come from.
 	bool closed; /// Set once `fd` has ended or failed, or an allocation was refused.
@@ -131,7 +131,7 @@ const(char)[] next(ref Reader r) @trusted {
 			r.closed = true;
 			return null;
 		}
-		immutable got = fp.file.readSome(r.fd, r.buffer[kept .. kept + size]);
+		immutable got = fp.io.readSome(r.fd, r.buffer[kept .. kept + size]);
 		cast(void) fp.dynarray.removeLast(r.buffer, size - (got > 0 ? got : 0));
 		if (got <= 0) r.closed = true;
 	}
@@ -154,7 +154,7 @@ bool send(int fd, const(char)[] body) {
 	char[fp.string.numbers.maxDecimalLength] digits;
 	foreach (c; fp.string.numbers.formatUnsigned(body.length, digits)) header[at++] = c;
 	foreach (c; "\r\n\r\n") header[at++] = c;
-	return fp.file.writeAll(fd, header[0 .. at]) && fp.file.writeAll(fd, body);
+	return fp.io.writeAll(fd, header[0 .. at]) && fp.io.writeAll(fd, body);
 }
 
 
@@ -214,7 +214,7 @@ unittest { // messages split across writes and run together come out whole and i
 	assert(fd >= 0);
 	scope(exit) closeFd(fd);
 	static immutable stream = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}content-length:2\r\n\r\n[]X-Other: 1\r\n\r\nContent-Length: 0\r\n\r\n";
-	foreach (i; 0 .. stream.length) assert(fp.file.writeSome(fd, stream[i .. i + 1]) == 1);
+	foreach (i; 0 .. stream.length) assert(fp.io.writeSome(fd, stream[i .. i + 1]) == 1);
 	assert(rewind(fd));
 	Reader r = Reader(fd);
 	scope(exit) free(r);
