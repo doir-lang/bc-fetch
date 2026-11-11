@@ -1,6 +1,9 @@
-/// An HTTP client shaped like fetch, for native builds and `wasm32-wasi` alike: a `Request` is plain data, `start` begins a `Fetch` without blocking, `poll` advances it, and `readBody` hands its body over as it arrives. `fetch` and `readAll` block, for code that would rather wait.
+/// An HTTP client shaped like fetch, for native builds and `wasm32-wasi` alike: a `Request` is plain data, `start` begins a `Fetch` without blocking, `poll` advances it, and `readBody` hands its body over as it arrives.
+/// `fetch` and `readAll` block, for code that would rather wait.
 ///
-/// It promises only what a browser's fetch can do, so code behaves the same on every target: no setting `Host` or other connection fields, and no reading cookies. Natively it speaks HTTP/1.1 over a socket per request, through `bc.http.message`, with OpenSSL for `https`, or SChannel on Windows, checking certificates against the system's trusted ones, and resolves host names on a thread so nothing blocks. On `wasm32-wasi` it calls the host's fetch through the `bc_http` imports that `js/bc-fetch.mjs` provides, and the module must export `bc_http_wake`.
+/// It promises only what a browser's fetch can do, so code behaves the same on every target: no setting `Host` or other connection fields, and no reading cookies.
+/// Natively it speaks HTTP/1.1 over a socket per request, through `bc.http.message`, with OpenSSL for `https`, or SChannel on Windows, checking certificates against the system's trusted ones, and resolves host names on a thread so nothing blocks.
+/// On `wasm32-wasi` it calls the host's fetch through the `bc_http` imports that `js/bc-fetch.mjs` provides, and the module must export `bc_http_wake`.
 ///
 /// Examples:
 /// ---
@@ -76,7 +79,8 @@ private struct Field {
 	size_t nameLength, valueLength;
 }
 
-/// Header fields: an ordered multimap from case-insensitive names to values, owning copies of both. Plain data, released by `free`.
+/// Header fields: an ordered multimap from case-insensitive names to values, owning copies of both.
+/// Plain data, released by `free`.
 struct Headers {
 	private char* text = null;
 	private Field* fields = null;
@@ -106,6 +110,7 @@ void free(ref Headers h) {
 /// assert(append(h, "A", "1") && append(h, "a", "2") && length(h) == 2);
 /// ---
 size_t length(ref const Headers h) {
+	assert(fp.dynarray.length(h.fields) == 0 || h.text !is null || fp.dynarray.back(h.fields).nameLength + fp.dynarray.back(h.fields).valueLength == 0, "bc.http: fields with no text to point into");
 	return fp.dynarray.length(h.fields);
 }
 
@@ -119,8 +124,9 @@ size_t length(ref const Headers h) {
 /// assert(at(h, 0) == Header("Accept", "*/*"));
 /// ---
 Header at(ref const Headers h, size_t i) @trusted {
-	assert(i < length(h));
+	assert(i < length(h), "bc.http: a field past the headers");
 	immutable f = h.fields[i];
+	assert(f.at + f.nameLength + f.valueLength <= fp.dynarray.length(h.text), "bc.http: a field past the headers' text");
 	return Header(h.text[f.at .. f.at + f.nameLength], h.text[f.at + f.nameLength .. f.at + f.nameLength + f.valueLength]);
 }
 
@@ -143,8 +149,10 @@ bool append(ref Headers h, const(char)[] name, const(char)[] value) @trusted {
 	core.stdc.string.memcpy(h.text + at + name.length, value.ptr, value.length);
 	if (!fp.dynarray.pushBack(h.fields, Field(at, name.length, value.length))) {
 		cast(void) fp.dynarray.removeLast(h.text, name.length + value.length);
+		assert(fp.dynarray.length(h.text) == at, "bc.http: a refused append left text behind");
 		return false;
 	}
+	assert(.at(h, length(h) - 1).name == name && .at(h, length(h) - 1).value == value, "bc.http: an appended field that reads back differently");
 	return true;
 }
 
@@ -161,6 +169,7 @@ bool append(ref Headers h, const(char)[] name, const(char)[] value) @trusted {
 void remove(ref Headers h, const(char)[] name) {
 	for (size_t i = length(h); i-- > 0;)
 		if (fp.string.ascii.equalIgnoringCase(at(h, i).name, name)) cast(void) fp.dynarray.removeAt(h.fields, i);
+	assert(get(h, name).isNull, "bc.http: a removed field still found");
 }
 
 /// Makes `name: value` the only field named `name`, after the others.
@@ -178,6 +187,7 @@ bool set(ref Headers h, const(char)[] name, const(char)[] value) {
 	if (!append(h, name, value)) return false;
 	for (size_t i = length(h) - 1; i-- > 0;)
 		if (fp.string.ascii.equalIgnoringCase(at(h, i).name, name)) cast(void) fp.dynarray.removeAt(h.fields, i);
+	assert(get(h, name).get.value == value, "bc.http: a set field that reads back differently");
 	return true;
 }
 
@@ -202,10 +212,13 @@ std.typecons.Nullable!Header get(ref const Headers h, const(char)[] name) {
 
 // Appends a copy of each of `from`'s fields to `to`; false, with `to` partly filled, if an allocation was refused.
 private bool appendAll(ref Headers to, ref const Headers from) {
+	assert(&to !is &from, "bc.http: appending headers to themselves");
+	immutable before = length(to);
 	foreach (i; 0 .. length(from)) {
 		auto f = at(from, i);
 		if (!append(to, f.name, f.value)) return false;
 	}
+	assert(length(to) == before + length(from), "bc.http: appended the wrong number of fields");
 	return true;
 }
 
@@ -216,17 +229,22 @@ private bool appendAll(ref Headers to, ref const Headers from) {
 enum Redirect : ubyte {
 	follow, /// Follows the redirect, up to `maxRedirects` of them.
 	error, /// Fails with `Failure.redirectRefused`.
-	manual, /// Hands over the redirecting response. A browser hides it: its status is then 0 and it has no fields.
+	/// Hands over the redirecting response.
+	/// A browser hides it: its status is then 0 and it has no fields.
+	manual,
 }
 
 /// The most redirects one `Fetch` follows before failing with `Failure.tooManyRedirects`, as fetch allows.
 enum ubyte maxRedirects = 20;
 
-/// What to ask for. Plain data: `start` copies what it needs, so the request can change or be freed once it returns.
+/// What to ask for.
+/// Plain data: `start` copies what it needs, so the request can change or be freed once it returns.
 struct Request {
 	const(char)[] url; /// An absolute `http` URL; a browser also takes `https` and URLs relative to the page.
 	const(char)[] method = "GET"; /// A token; `get`, `post` and the other standard methods are made upper case, as fetch does.
-	Headers headers; /// Fields to send. Natively, ones the connection manages, such as `Host`, `Content-Length` and `Connection`, are dropped; a browser drops more, such as `Cookie`.
+	/// Fields to send.
+	/// Natively, ones the connection manages, such as `Host`, `Content-Length` and `Connection`, are dropped; a browser drops more, such as `Cookie`.
+	Headers headers;
 	const(char)[] body; /// What to send after the head; a `GET` or `HEAD` request must have none.
 	Redirect redirect = Redirect.follow; /// What to do when redirected.
 	uint timeoutMs = 0; /// How long the whole exchange, body included, may take before failing with `Failure.timeout`; 0 for no limit.
@@ -248,7 +266,9 @@ enum Failure : ubyte {
 	unsupported, /// The URL's scheme is not one this target can fetch, such as `ftp`, or OpenSSL or SChannel could not set up `https`.
 	network, /// The host could not be found or reached, its certificate was not trusted for its name, the connection broke, or the response was not HTTP.
 	timeout, /// `Request.timeoutMs` passed.
-	tooManyRedirects, /// It was redirected more than `maxRedirects` times. A browser does not say so, and reports `network` instead.
+	/// It was redirected more than `maxRedirects` times.
+	/// A browser does not say so, and reports `network` instead.
+	tooManyRedirects,
 	redirectRefused, /// It was redirected under `Redirect.error`.
 	aborted, /// `abort` stopped it.
 	outOfMemory, /// An allocation was refused.
@@ -312,7 +332,8 @@ version (WASI) {
 	}
 }
 
-/// One request and its response, from `start` until `free`. Plain data owned by the caller; its members are read-only to it, and `free` releases it and stops it if it is still going.
+/// One request and its response, from `start` until `free`.
+/// Plain data owned by the caller; its members are read-only to it, and `free` releases it and stops it if it is still going.
 struct Fetch {
 	State state; /// Where it is.
 	Failure failure; /// Why it failed, once `state` is `State.failed`.
@@ -482,7 +503,9 @@ version (WASI) {
 	}
 
 	private void release(ref Exchange e) {
+		assert(e.taken <= fp.dynarray.length(e.ready), "bc.http: a reader's cursor past what is ready");
 		disconnect(e);
+		assert(e.fd == Exchange.init.fd, "bc.http: an exchange still connected after disconnecting");
 		fp.dynarray.free(e.method);
 		free(e.headers);
 		fp.dynarray.free(e.payload);
@@ -494,9 +517,20 @@ version (WASI) {
 	}
 
 	private void fail(ref Fetch f, Failure why) {
+		assert(why != Failure.none, "bc.http: failing for no reason");
 		f.state = State.failed;
 		f.failure = why;
 		disconnect(f.exchange);
+		assert(valid(f), "bc.http: a failed fetch that breaks its invariants");
+	}
+
+	// Whether `f` keeps what its state promises: a failure exactly when failed, a status only from the head on, the reader's cursor within what is ready, and no connection once it has stopped.
+	private bool valid(ref const Fetch f) {
+		auto e = &f.exchange;
+		if ((f.state == State.failed) != (f.failure != Failure.none)) return false;
+		if (f.state == State.pending ? f.status != 0 : f.status > 999) return false;
+		if (e.taken > fp.dynarray.length(e.ready)) return false;
+		return !(f.state == State.done || f.state == State.failed) || e.fd == Exchange.init.fd;
 	}
 
 	// Writes request `e` for `url` into `e.out_`, replacing what was there; false if an allocation was refused.
@@ -516,7 +550,10 @@ version (WASI) {
 			char[fp.string.numbers.maxDecimalLength] digits;
 			if (!bc.http.message.writeField(e.out_, "Content-Length", fp.string.numbers.formatUnsigned(size, digits))) return false;
 		}
-		return bc.http.message.writeField(e.out_, "Connection", "close") && bc.http.message.endHead(e.out_) && fp.dynarray.concatenate(e.out_, fp.dynarray.slice(e.payload));
+		immutable composed = bc.http.message.writeField(e.out_, "Connection", "close") && bc.http.message.endHead(e.out_) && fp.dynarray.concatenate(e.out_, fp.dynarray.slice(e.payload));
+		assert(!composed || fp.dynarray.length(e.out_) >= size + "Host: \r\n\r\n".length, "bc.http: a request shorter than its body and head");
+		assert(e.sent == 0, "bc.http: a request composed partway through sending");
+		return composed;
 	}
 
 	// Starts fetching `f.url` afresh: writes the request, sets up TLS for https, and resolves the host, on a thread unless it is an address.
@@ -532,6 +569,7 @@ version (WASI) {
 
 		// Whichever thread drops the last reference frees the block, so the allocator that made it travels with it.
 		auto allocate = fp.pointer.allocator;
+		assert(e.lookup is null && e.fd == Exchange.init.fd, "bc.http: connecting an exchange that is still connected");
 		auto l = cast(Lookup*) allocate(null, Lookup.sizeof);
 		if (l is null) return fail(f, Failure.outOfMemory);
 		*l = Lookup.init;
@@ -541,6 +579,7 @@ version (WASI) {
 		core.stdc.string.memcpy(l.host.ptr, url.host.ptr, url.host.length);
 		char[fp.string.numbers.maxDecimalLength] buffer;
 		const digits = fp.string.numbers.formatUnsigned(url.port, buffer);
+		assert(digits.length < l.port.length, "bc.http: a port with more digits than a ushort has");
 		core.stdc.string.memcpy(l.port.ptr, digits.ptr, digits.length);
 
 		immutable address = lookUp(*l, true) == 0;
@@ -566,6 +605,7 @@ version (WASI) {
 
 	// The URL `location` names, read against `base`, as a new fp dynarray; null if an allocation was refused.
 	private char* resolve(const(char)[] base, const(char)[] location) {
+		assert(!bc.http.message.parseUrl(base).isNull, "bc.http: resolving against a URL that does not parse");
 		auto b = bc.http.message.parseUrl(base).get;
 		size_t i = 0;
 		while (i < location.length && ((location[i] >= 'a' && location[i] <= 'z') || (location[i] >= 'A' && location[i] <= 'Z') || (i > 0 && ((location[i] >= '0' && location[i] <= '9') || location[i] == '+' || location[i] == '-' || location[i] == '.')))) ++i;
@@ -598,6 +638,7 @@ version (WASI) {
 			fp.dynarray.free(joined);
 			return null;
 		}
+		assert(fp.dynarray.length(joined) >= location.length, "bc.http: a resolved URL shorter than its location");
 		return joined;
 	}
 
@@ -606,6 +647,7 @@ version (WASI) {
 		auto e = &f.exchange;
 		if (e.redirect == Redirect.error) return fail(f, Failure.redirectRefused);
 		if (e.redirects == maxRedirects) return fail(f, Failure.tooManyRedirects);
+		assert(e.redirects < maxRedirects, "bc.http: redirected past maxRedirects");
 		++e.redirects;
 		char* next = resolve(f.url, location);
 		if (next is null) return fail(f, Failure.outOfMemory);
@@ -645,6 +687,7 @@ version (WASI) {
 				}
 				if (h.progress == bc.http.message.Progress.malformed) return fail(f, Failure.network);
 				if (h.status >= 200 || h.status < 100 || h.status == 101) break;
+				assert(h.size > 0 && h.size <= fp.dynarray.length(e.in_), "bc.http: an interim head that consumed nothing, or more than arrived");
 				cast(void) fp.dynarray.removeRange(e.in_, 0, h.size);
 			}
 			if (e.redirect != Redirect.manual && (h.status == 301 || h.status == 302 || h.status == 303 || h.status == 307 || h.status == 308)) {
@@ -660,6 +703,7 @@ version (WASI) {
 		}
 		auto d = bc.http.message.decode(e.body, fp.dynarray.slice(e.in_));
 		if (d.malformed) return fail(f, Failure.network);
+		assert(d.produced <= d.used && d.used <= fp.dynarray.length(e.in_), "bc.http: decoding claimed bytes it was not given");
 		if (!fp.dynarray.concatenate(e.ready, e.in_[0 .. d.produced])) return fail(f, Failure.outOfMemory);
 		cast(void) fp.dynarray.removeRange(e.in_, 0, d.used);
 		if (bc.http.message.ended(e.body) || (e.eof && e.body.framing == bc.http.message.Framing.close)) {
@@ -672,11 +716,14 @@ version (WASI) {
 	private enum size_t maxReady = 1 << 20;
 
 	private size_t buffered(ref const Fetch f) {
+		assert(f.exchange.taken <= fp.dynarray.length(f.exchange.ready), "bc.http: a reader's cursor past what is ready");
 		return fp.dynarray.length(f.exchange.ready) - f.exchange.taken;
 	}
 
 	private bool begin(ref Fetch f, ref const Request r, const(char)[] method) {
 		auto e = &f.exchange;
+		assert(f.state == State.pending && f.urlText is null, "bc.http: beginning a fetch that already began");
+		assert(bc.http.message.validName(method), "bc.http: beginning with a method that is not a token");
 		e.redirect = r.redirect;
 		if (!fp.dynarray.concatenate(f.urlText, r.url) || fp.dynarray.reserve(e.method, "GET".length) is null || !fp.dynarray.concatenate(e.method, method) || !appendAll(e.headers, r.headers) || !fp.dynarray.concatenate(e.payload, r.body)) return false;
 		f.url = fp.dynarray.slice(f.urlText);
@@ -688,9 +735,11 @@ version (WASI) {
 
 	private size_t take(ref Fetch f, char[] into) @trusted {
 		auto e = &f.exchange;
+		assert(into.ptr !is null || into.length == 0, "bc.http: taking body bytes into nowhere");
 		immutable n = buffered(f) < into.length ? buffered(f) : into.length;
 		core.stdc.string.memcpy(into.ptr, e.ready + e.taken, n);
 		e.taken += n;
+		assert(e.taken <= fp.dynarray.length(e.ready), "bc.http: took past what is ready");
 		if (e.taken == fp.dynarray.length(e.ready)) {
 			fp.dynarray.clear(e.ready);
 			e.taken = 0;
@@ -762,6 +811,7 @@ version (WASI) {
 			SSL_CTX_set_verify(context, sslVerifyPeer, null);
 			tlsShared = context;
 		}
+		assert(bc.spinlock.isLockedForWriting(tlsLock), "bc.http: the TLS context read outside its lock");
 		return tlsShared;
 	}
 
@@ -777,13 +827,18 @@ version (WASI) {
 	}
 
 	private void drop(Lookup* l) @trusted {
-		if (l is null || core.atomic.atomicOp!"-="(l.references, 1) != 0) return;
+		if (l is null) return;
+		assert(core.atomic.atomicLoad(l.references) > 0, "bc.http: dropping a lookup no one holds");
+		assert(l.memory !is null, "bc.http: a lookup that does not know its allocator");
+		if (core.atomic.atomicOp!"-="(l.references, 1) != 0) return;
 		foreach (fd; l.done) if (fd >= 0) cast(void) core.sys.posix.unistd.close(fd);
 		if (l.found !is null) core.sys.posix.netdb.freeaddrinfo(l.found);
 		cast(void) l.memory(cast(void*) l, 0);
 	}
 
 	private int lookUp(ref Lookup l, bool numeric) @trusted {
+		assert(l.host[0] != 0 && l.host[$ - 1] == 0, "bc.http: looking up an empty or unterminated host");
+		assert(l.found is null, "bc.http: looking up a host already found");
 		core.sys.posix.netdb.addrinfo hints;
 		hints.ai_socktype = core.sys.posix.sys.socket.SOCK_STREAM;
 		hints.ai_flags = numeric ? core.sys.posix.netdb.AI_NUMERICHOST : 0;
@@ -791,6 +846,7 @@ version (WASI) {
 	}
 
 	private void resolveOnThread(Lookup* l) @trusted {
+		assert(l !is null && l.done[1] >= 0, "bc.http: resolving with no pipe to signal through");
 		l.error = lookUp(*l, false);
 		immutable char one = 1;
 		cast(void) core.sys.posix.unistd.write(l.done[1], &one, 1);
@@ -798,8 +854,10 @@ version (WASI) {
 	}
 
 	private void nonblocking(int fd) @trusted {
+		assert(fd >= 0, "bc.http: making no descriptor nonblocking");
 		cast(void) core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_SETFD, core.sys.posix.fcntl.FD_CLOEXEC);
 		cast(void) core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_SETFL, core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_GETFL) | core.sys.posix.fcntl.O_NONBLOCK);
+		assert((core.sys.posix.fcntl.fcntl(fd, core.sys.posix.fcntl.F_GETFL) & core.sys.posix.fcntl.O_NONBLOCK) != 0, "bc.http: a descriptor that would still block");
 	}
 
 	// Makes the pipe the resolving thread signals through; false if it cannot.
@@ -819,6 +877,7 @@ version (WASI) {
 		if (e.tls.ssl !is null) SSL_free(e.tls.ssl);
 		e.tls = Tls.init;
 		fp.dynarray.clear(e.wire);
+		assert(e.fd == -1 && e.lookup is null && e.tls.ssl is null, "bc.http: an exchange left connected");
 	}
 
 	// Starts connecting to the first address from `a` that takes a socket, remembering the rest; fails `f` if none does.
@@ -833,6 +892,7 @@ version (WASI) {
 				cast(void) core.sys.posix.sys.socket.setsockopt(fd, core.sys.posix.sys.socket.SOL_SOCKET, core.sys.posix.sys.socket.SO_NOSIGPIPE, &one, one.sizeof);
 			}
 			if (core.sys.posix.sys.socket.connect(fd, a.ai_addr, a.ai_addrlen) == 0 || core.stdc.errno.errno == core.stdc.errno.EINPROGRESS) {
+				assert(e.fd == -1, "bc.http: dialling over a live connection");
 				e.fd = fd;
 				e.next = a.ai_next;
 				e.phase = Phase.connecting;
@@ -846,6 +906,8 @@ version (WASI) {
 
 	// Sets up TLS for `host`, checking the certificate against it as a name or, when `address`, an IP address; fails `f` if it cannot.
 	private bool secure(ref Fetch f, const(char)* host, bool address) @trusted {
+		assert(host !is null && *host != 0, "bc.http: securing a connection to no host");
+		assert(f.exchange.tls.ssl is null, "bc.http: securing a connection twice");
 		auto context = tlsContext();
 		if (context is null) {
 			fail(f, Failure.unsupported);
@@ -896,20 +958,25 @@ version (WASI) {
 				return false;
 			}
 			e.sent += wrote;
+			assert(e.sent <= total, "bc.http: sent more than the request holds");
 		}
 		if (e.tls.ssl !is null) {
 			fp.dynarray.clear(e.wire);
 			e.sent = 0;
 		}
+		assert(e.tls.ssl !is null || e.sent == total, "bc.http: a plain request reported sent with bytes left");
 		return true;
 	}
 
 	// Moves the records TLS has written into `wire`, to be sent; false if an allocation was refused.
 	private bool seal(ref Exchange e) @trusted {
+		assert(e.tls.write !is null, "bc.http: sealing with no TLS");
 		for (size_t pending; (pending = BIO_ctrl_pending(e.tls.write)) > 0;) {
+			assert(pending <= int.max, "bc.http: more TLS records pending than one read takes");
 			immutable at = fp.dynarray.length(e.wire);
 			if (fp.dynarray.grow(e.wire, pending) is null) return false;
-			cast(void) BIO_read(e.tls.write, e.wire + at, cast(int) pending);
+			immutable read = BIO_read(e.tls.write, e.wire + at, cast(int) pending);
+			assert(read == pending, "bc.http: TLS gave fewer record bytes than it had pending");
 		}
 		return true;
 	}
@@ -928,6 +995,7 @@ version (WASI) {
 				fail(f, Failure.network);
 				return false;
 			}
+			assert(wrote <= n, "bc.http: TLS took more than it was given");
 			at += wrote;
 			if (!seal(*e)) {
 				fail(f, Failure.outOfMemory);
@@ -953,6 +1021,7 @@ version (WASI) {
 			fail(f, Failure.network);
 			return Pulled.broken;
 		}
+		assert(got <= bytes.length, "bc.http: received more than the buffer holds");
 		bool failed = false;
 		version (unittest) failed = simulatedFailure();
 		if (failed || BIO_write(e.tls.read, bytes.ptr, cast(int) got) != got) {
@@ -962,56 +1031,168 @@ version (WASI) {
 		return Pulled.some;
 	}
 
+	// The steps of `advance`, one per phase: each returns whether the exchange can go further now, false once it must wait for its socket or has failed.
+
+	private bool finishResolving(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		assert(e.phase == Phase.resolving && e.lookup !is null && e.lookup.done[0] >= 0, "bc.http: finishing a lookup that is not running");
+		char one;
+		ptrdiff_t got;
+		do got = core.sys.posix.unistd.read(e.lookup.done[0], &one, 1);
+		while (got < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR);
+		if (got <= 0) return false;
+		if (e.lookup.error != 0) {
+			fail(f, Failure.network);
+			return false;
+		}
+		dial(f, e.lookup.found);
+		return true;
+	}
+
+	private bool finishConnecting(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		assert(e.phase == Phase.connecting && e.fd >= 0, "bc.http: finishing a connection that is not being made");
+		core.sys.posix.poll.pollfd p = {e.fd, core.sys.posix.poll.POLLOUT};
+		if (core.sys.posix.poll.poll(&p, 1, 0) <= 0) return false;
+		int error = 0;
+		core.sys.posix.sys.socket.socklen_t size = error.sizeof;
+		if (core.sys.posix.sys.socket.getsockopt(e.fd, core.sys.posix.sys.socket.SOL_SOCKET, core.sys.posix.sys.socket.SO_ERROR, &error, &size) != 0 || error != 0) {
+			cast(void) core.sys.posix.unistd.close(e.fd);
+			e.fd = -1;
+			dial(f, e.next);
+			return true;
+		}
+		drop(e.lookup);
+		e.lookup = null;
+		e.next = null;
+		e.phase = e.tls.ssl !is null ? Phase.handshaking : Phase.sending;
+		assert(e.sent == 0, "bc.http: connected with part of the request already sent");
+		return true;
+	}
+
+	private bool shakeHands(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		assert(e.phase == Phase.handshaking && e.tls.ssl !is null, "bc.http: a handshake with no TLS");
+		ERR_clear_error();
+		immutable result = SSL_do_handshake(e.tls.ssl);
+		if (!seal(*e)) {
+			fail(f, Failure.outOfMemory);
+			return false;
+		}
+		if (!transmit(f)) return false;
+		if (result == 1) {
+			if (!encrypt(f)) return false;
+			e.phase = Phase.sending;
+			return true;
+		}
+		immutable error = SSL_get_error(e.tls.ssl, result);
+		if (error == sslErrorWantWrite) return true;
+		if (error != sslErrorWantRead) {
+			fail(f, Failure.network);
+			return false;
+		}
+		final switch (pull(f)) {
+		case Pulled.some:
+			return true;
+		case Pulled.end:
+			fail(f, Failure.network);
+			return false;
+		case Pulled.later, Pulled.broken:
+			return false;
+		}
+	}
+
+	// Reads up to `chunk` decrypted bytes onto `e.in_`.
+	// `again` is set when TLS took in records but has no bytes yet, so there is nothing to digest.
+	private bool receiveEncrypted(ref Fetch f, size_t chunk, out bool again) @trusted {
+		auto e = &f.exchange;
+		assert(chunk <= int.max && fp.dynarray.length(e.in_) >= chunk, "bc.http: no room made for what TLS reads");
+		immutable kept = fp.dynarray.length(e.in_) - chunk;
+		ERR_clear_error();
+		immutable result = SSL_read(e.tls.ssl, e.in_ + kept, cast(int) chunk);
+		assert(result <= cast(int) chunk, "bc.http: TLS read more than there was room for");
+		cast(void) fp.dynarray.removeLast(e.in_, chunk - (result > 0 ? result : 0));
+		// TLS may owe the server records even while reading, such as an answer to a key update.
+		if (!seal(*e)) {
+			fail(f, Failure.outOfMemory);
+			return false;
+		}
+		if (fp.dynarray.length(e.wire) && !transmit(f) && f.state == State.failed) return false;
+		if (result > 0) return true;
+		immutable error = SSL_get_error(e.tls.ssl, result);
+		if (error == sslErrorZeroReturn) {
+			e.eof = true;
+			return true;
+		}
+		if (error != sslErrorWantRead) {
+			fail(f, Failure.network);
+			return false;
+		}
+		final switch (pull(f)) {
+		case Pulled.some:
+			again = true;
+			return true;
+		case Pulled.end:
+			e.eof = true;
+			return true;
+		case Pulled.later, Pulled.broken:
+			return false;
+		}
+	}
+
+	// Reads up to `chunk` bytes off the socket onto `e.in_`.
+	private bool receivePlain(ref Fetch f, size_t chunk) @trusted {
+		auto e = &f.exchange;
+		assert(fp.dynarray.length(e.in_) >= chunk && e.fd >= 0, "bc.http: receiving with no room made, or no connection");
+		immutable kept = fp.dynarray.length(e.in_) - chunk;
+		ptrdiff_t got;
+		do got = core.sys.posix.sys.socket.recv(e.fd, e.in_ + kept, chunk, 0);
+		while (got < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR);
+		assert(got <= cast(ptrdiff_t) chunk, "bc.http: received more than there was room for");
+		cast(void) fp.dynarray.removeLast(e.in_, chunk - (got > 0 ? got : 0));
+		if (got < 0 && wouldBlock()) {
+			e.events = core.sys.posix.poll.POLLIN;
+			return false;
+		}
+		if (got < 0) {
+			fail(f, Failure.network);
+			return false;
+		}
+		if (got == 0) e.eof = true;
+		return true;
+	}
+
+	private bool receive(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		assert(e.phase == Phase.receiving, "bc.http: receiving before the request was sent");
+		if (buffered(f) >= maxReady) return false;
+		enum size_t chunk = 1 << 14;
+		immutable before = fp.dynarray.length(e.in_);
+		if (fp.dynarray.grow(e.in_, chunk) is null) {
+			fail(f, Failure.outOfMemory);
+			return false;
+		}
+		bool again = false;
+		if (e.tls.ssl !is null ? !receiveEncrypted(f, chunk, again) : !receivePlain(f, chunk)) return false;
+		assert(fp.dynarray.length(e.in_) <= before + chunk, "bc.http: received more than one chunk");
+		if (!again) digest(f);
+		return true;
+	}
+
 	private void advance(ref Fetch f) @trusted {
+		assert(valid(f), "bc.http: a fetch broke its state's invariants");
+		scope(exit) assert(valid(f), "bc.http: a fetch broke its state's invariants");
 		auto e = &f.exchange;
 		while (f.state == State.pending || f.state == State.head) {
 			final switch (e.phase) {
 			case Phase.resolving:
-				char one;
-				ptrdiff_t got;
-				do got = core.sys.posix.unistd.read(e.lookup.done[0], &one, 1);
-				while (got < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR);
-				if (got <= 0) return;
-				if (e.lookup.error != 0) return fail(f, Failure.network);
-				dial(f, e.lookup.found);
+				if (!finishResolving(f)) return;
 				break;
 			case Phase.connecting:
-				core.sys.posix.poll.pollfd p = {e.fd, core.sys.posix.poll.POLLOUT};
-				if (core.sys.posix.poll.poll(&p, 1, 0) <= 0) return;
-				int error = 0;
-				core.sys.posix.sys.socket.socklen_t size = error.sizeof;
-				if (core.sys.posix.sys.socket.getsockopt(e.fd, core.sys.posix.sys.socket.SOL_SOCKET, core.sys.posix.sys.socket.SO_ERROR, &error, &size) != 0 || error != 0) {
-					cast(void) core.sys.posix.unistd.close(e.fd);
-					e.fd = -1;
-					dial(f, e.next);
-					break;
-				}
-				drop(e.lookup);
-				e.lookup = null;
-				e.next = null;
-				e.phase = e.tls.ssl !is null ? Phase.handshaking : Phase.sending;
+				if (!finishConnecting(f)) return;
 				break;
 			case Phase.handshaking:
-				ERR_clear_error();
-				immutable result = SSL_do_handshake(e.tls.ssl);
-				if (!seal(*e)) return fail(f, Failure.outOfMemory);
-				if (!transmit(f)) return;
-				if (result == 1) {
-					if (!encrypt(f)) return;
-					e.phase = Phase.sending;
-					break;
-				}
-				immutable error = SSL_get_error(e.tls.ssl, result);
-				if (error == sslErrorWantWrite) break;
-				if (error != sslErrorWantRead) return fail(f, Failure.network);
-				final switch (pull(f)) {
-				case Pulled.some:
-					break;
-				case Pulled.end:
-					return fail(f, Failure.network);
-				case Pulled.later, Pulled.broken:
-					return;
-				}
+				if (!shakeHands(f)) return;
 				break;
 			case Phase.sending:
 				if (!transmit(f)) return;
@@ -1019,44 +1200,7 @@ version (WASI) {
 				e.events = core.sys.posix.poll.POLLIN;
 				break;
 			case Phase.receiving:
-				if (buffered(f) >= maxReady) return;
-				enum size_t chunk = 1 << 14;
-				immutable kept = fp.dynarray.length(e.in_);
-				if (fp.dynarray.grow(e.in_, chunk) is null) return fail(f, Failure.outOfMemory);
-				if (e.tls.ssl !is null) {
-					ERR_clear_error();
-					immutable result = SSL_read(e.tls.ssl, e.in_ + kept, cast(int) chunk);
-					cast(void) fp.dynarray.removeLast(e.in_, chunk - (result > 0 ? result : 0));
-					// TLS may owe the server records even while reading, such as an answer to a key update.
-					if (!seal(*e)) return fail(f, Failure.outOfMemory);
-					if (fp.dynarray.length(e.wire) && !transmit(f) && f.state == State.failed) return;
-					if (result <= 0) {
-						immutable error = SSL_get_error(e.tls.ssl, result);
-						if (error == sslErrorZeroReturn) e.eof = true;
-						else if (error != sslErrorWantRead) return fail(f, Failure.network);
-						else final switch (pull(f)) {
-						case Pulled.some:
-							continue;
-						case Pulled.end:
-							e.eof = true;
-							break;
-						case Pulled.later, Pulled.broken:
-							return;
-						}
-					}
-				} else {
-					ptrdiff_t got;
-					do got = core.sys.posix.sys.socket.recv(e.fd, e.in_ + kept, chunk, 0);
-					while (got < 0 && core.stdc.errno.errno == core.stdc.errno.EINTR);
-					cast(void) fp.dynarray.removeLast(e.in_, chunk - (got > 0 ? got : 0));
-					if (got < 0 && wouldBlock()) {
-						e.events = core.sys.posix.poll.POLLIN;
-						return;
-					}
-					if (got < 0) return fail(f, Failure.network);
-					if (got == 0) e.eof = true;
-				}
-				digest(f);
+				if (!receive(f)) return;
 				break;
 			}
 		}
@@ -1384,7 +1528,10 @@ version (Windows) {
 	}
 
 	private void drop(Lookup* l) @trusted {
-		if (l is null || core.atomic.atomicOp!"-="(l.references, 1) != 0) return;
+		if (l is null) return;
+		assert(core.atomic.atomicLoad(l.references) > 0, "bc.http: dropping a lookup no one holds");
+		assert(l.memory !is null, "bc.http: a lookup that does not know its allocator");
+		if (core.atomic.atomicOp!"-="(l.references, 1) != 0) return;
 		if (l.done !is null) cast(void) CloseHandle(l.done);
 		if (l.found !is null) freeaddrinfo(l.found);
 		cast(void) l.memory(cast(void*) l, 0);
@@ -1497,6 +1644,7 @@ version (Windows) {
 				return false;
 			}
 			e.sent += wrote;
+			assert(e.sent <= total, "bc.http: sent more than the request holds");
 		}
 		if (e.tls.name !is null) {
 			fp.dynarray.clear(e.wire);
@@ -1545,7 +1693,73 @@ version (Windows) {
 		return transmit(f);
 	}
 
+	// Decrypts what has arrived onto `e.in_`.
+	// False once the exchange must wait or has failed; `again` is set when there is nothing to digest yet though it can go on.
+	private bool receiveEncrypted(ref Fetch f, out bool again) @trusted {
+		auto e = &f.exchange;
+		// A post-handshake message, such as a TLS 1.3 session ticket, reopens the handshake until SSPI has taken it.
+		auto opened = e.tls.done ? unseal(e.tls, e.in_) : Opened.more;
+		if (!e.tls.done || opened == Opened.reopened) {
+			Shake result;
+			if (!shake(f, result, opened == Opened.reopened) && f.state == State.failed) return false;
+			if (result == Shake.done) {
+				again = true;
+				return true;
+			}
+			opened = Opened.more;
+		}
+		final switch (opened) {
+		case Opened.some:
+			return true;
+		case Opened.closed:
+			e.eof = true;
+			return true;
+		case Opened.more:
+			final switch (pull(f)) {
+			case Pulled.some:
+				again = true;
+				return true;
+			case Pulled.end:
+				e.eof = true;
+				return true;
+			case Pulled.later, Pulled.broken:
+				return false;
+			}
+		case Opened.reopened:
+			assert(0);
+		case Opened.failed:
+			fail(f, Failure.network);
+			return false;
+		case Opened.outOfMemory:
+			fail(f, Failure.outOfMemory);
+			return false;
+		}
+	}
+
+	// Reads what the socket has onto `e.in_`.
+	// False once the exchange must wait or has failed.
+	private bool receivePlain(ref Fetch f) @trusted {
+		auto e = &f.exchange;
+		enum size_t chunk = 1 << 14;
+		immutable kept = fp.dynarray.length(e.in_);
+		if (fp.dynarray.grow(e.in_, chunk) is null) {
+			fail(f, Failure.outOfMemory);
+			return false;
+		}
+		immutable got = recv(e.fd, e.in_ + kept, cast(int) chunk, 0);
+		cast(void) fp.dynarray.removeLast(e.in_, chunk - (got > 0 ? got : 0));
+		if (got < 0 && WSAGetLastError() == wsaeWouldBlock) return false;
+		if (got < 0) {
+			fail(f, Failure.network);
+			return false;
+		}
+		if (got == 0) e.eof = true;
+		return true;
+	}
+
 	private void advance(ref Fetch f) @trusted {
+		assert(valid(f), "bc.http: a fetch broke its state's invariants");
+		scope(exit) assert(valid(f), "bc.http: a fetch broke its state's invariants");
 		auto e = &f.exchange;
 		// Reset before trying anything, so whatever becomes ready from here on sets it again.
 		if (e.event !is null) cast(void) ResetEvent(e.event);
@@ -1591,50 +1805,9 @@ version (Windows) {
 				break;
 			case Phase.receiving:
 				if (buffered(f) >= maxReady) return;
-				if (e.tls.name !is null) {
-					// A post-handshake message, such as a TLS 1.3 session ticket, reopens the handshake until SSPI has taken it.
-					auto opened = e.tls.done ? unseal(e.tls, e.in_) : Opened.more;
-					if (!e.tls.done || opened == Opened.reopened) {
-						Shake result;
-						if (!shake(f, result, opened == Opened.reopened) && f.state == State.failed) return;
-						if (result == Shake.done) continue;
-						opened = Opened.more;
-					}
-					final switch (opened) {
-					case Opened.some:
-						break;
-					case Opened.closed:
-						e.eof = true;
-						break;
-					case Opened.more:
-						final switch (pull(f)) {
-						case Pulled.some:
-							continue;
-						case Pulled.end:
-							e.eof = true;
-							break;
-						case Pulled.later, Pulled.broken:
-							return;
-						}
-						break;
-					case Opened.reopened:
-						assert(0);
-					case Opened.failed:
-						return fail(f, Failure.network);
-					case Opened.outOfMemory:
-						return fail(f, Failure.outOfMemory);
-					}
-				} else {
-					enum size_t chunk = 1 << 14;
-					immutable kept = fp.dynarray.length(e.in_);
-					if (fp.dynarray.grow(e.in_, chunk) is null) return fail(f, Failure.outOfMemory);
-					immutable got = recv(e.fd, e.in_ + kept, cast(int) chunk, 0);
-					cast(void) fp.dynarray.removeLast(e.in_, chunk - (got > 0 ? got : 0));
-					if (got < 0 && WSAGetLastError() == wsaeWouldBlock) return;
-					if (got < 0) return fail(f, Failure.network);
-					if (got == 0) e.eof = true;
-				}
-				digest(f);
+				bool again = false;
+				if (e.tls.name !is null ? !receiveEncrypted(f, again) : !receivePlain(f)) return;
+				if (!again) digest(f);
 				break;
 			}
 		}
@@ -1673,6 +1846,7 @@ private bool going(ref const Fetch f) {
 // Fails `f` with `Failure.timeout` if its deadline has passed.
 private void expire(ref Fetch f, ulong now) {
 	if (going(f) && f.deadline && now >= f.deadline) fail(f, Failure.timeout);
+	assert(!going(f) || !f.deadline || now < f.deadline, "bc.http: a fetch still going past its deadline");
 }
 
 /// Releases everything `f` holds, stopping it first if it is still going, and leaves it empty.
@@ -1690,9 +1864,11 @@ void free(ref Fetch f) {
 	fp.dynarray.free(f.urlText);
 	fp.dynarray.free(f.whole);
 	f = Fetch.init;
+	assert(f.state == State.pending && f.urlText is null, "bc.http.free: a fetch left holding memory");
 }
 
-/// Begins fetching `r` without waiting for anything: natively it starts resolving the host on a thread of its own, or connecting at once to an IP address. A request it can tell is wrong at once, such as one with an invalid method or URL, comes back already in `State.failed`, with `failure` saying why.
+/// Begins fetching `r` without waiting for anything: natively it starts resolving the host on a thread of its own, or connecting at once to an IP address.
+/// A request it can tell is wrong at once, such as one with an invalid method or URL, comes back already in `State.failed`, with `failure` saying why.
 ///
 /// Returns an empty `Nullable` only if an allocation was refused.
 ///
@@ -1721,6 +1897,8 @@ std.typecons.Nullable!Fetch start(ref const Request r) {
 		free(f);
 		return typeof(return).init;
 	}
+	assert(f.state != State.done, "bc.http.start: a fetch done before it was polled");
+	assert(f.state == State.failed || f.url.length > 0, "bc.http.start: a fetch going to no URL");
 	return typeof(return)(f);
 }
 
@@ -1734,8 +1912,10 @@ std.typecons.Nullable!Fetch start(ref const Request r) {
 /// assert(poll(f.get) == State.failed);
 /// ---
 State poll(ref Fetch f) {
+	immutable before = f.state;
 	if (going(f)) advance(f);
 	expire(f, milliseconds());
+	assert(f.state >= before, "bc.http.poll: a fetch that went back a state");
 	return f.state;
 }
 
@@ -1751,12 +1931,16 @@ State poll(ref Fetch f) {
 /// ---
 void abort(ref Fetch f) {
 	if (going(f)) fail(f, Failure.aborted);
+	assert(!going(f), "bc.http.abort: a fetch still going after it was aborted");
 }
 
 /// The most fetches one `wait` call watches.
 enum size_t maxWaited = 64;
 
-/// Waits until one of `fs` can make progress, has body bytes to read, or has finished, or until `timeoutMs` passes; a negative `timeoutMs` waits as long as it takes. Then `poll` the ones of interest. It wakes for a fetch whose `Request.timeoutMs` passes, too. In a browser it cannot wait on the main thread; use `setWake` there instead.
+/// Waits until one of `fs` can make progress, has body bytes to read, or has finished, or until `timeoutMs` passes; a negative `timeoutMs` waits as long as it takes.
+/// Then `poll` the ones of interest.
+/// It wakes for a fetch whose `Request.timeoutMs` passes, too.
+/// In a browser it cannot wait on the main thread; use `setWake` there instead.
 ///
 /// Returns false if `timeoutMs` passed first.
 ///
@@ -1777,6 +1961,7 @@ bool wait(Fetch*[] fs, int timeoutMs) {
 	}
 	if (waitFor(fs, timeoutMs)) return true;
 	immutable later = milliseconds();
+	assert(later >= now, "bc.http.wait: a monotonic clock that went backwards");
 	foreach (f; fs) if (f.deadline && later >= f.deadline) return true;
 	return false;
 }
@@ -1784,7 +1969,9 @@ bool wait(Fetch*[] fs, int timeoutMs) {
 private __gshared void function(void* context) @nogc nothrow wakeHook;
 private __gshared void* wakeContext;
 
-/// Has `hook` called with `context` whenever a fetch may have progressed on its own, so `poll` is worth calling; null stops it. Only a host that runs fetches beside the caller calls it: a browser's main thread, which cannot `wait`. Natively a fetch progresses only inside `poll`, so it is never called.
+/// Has `hook` called with `context` whenever a fetch may have progressed on its own, so `poll` is worth calling; null stops it.
+/// Only a host that runs fetches beside the caller calls it: a browser's main thread, which cannot `wait`.
+/// Natively a fetch progresses only inside `poll`, so it is never called.
 ///
 /// Examples:
 /// ---
@@ -1799,7 +1986,8 @@ void setWake(void function(void* context) @nogc nothrow hook, void* context) {
 }
 
 version (WASI) {
-	/// Called by js/bc-fetch.mjs when a fetch has progressed while no `wait` was blocked on it; it calls the `setWake` hook. The module must export it.
+	/// Called by js/bc-fetch.mjs when a fetch has progressed while no `wait` was blocked on it; it calls the `setWake` hook.
+	/// The module must export it.
 	///
 	/// Examples:
 	/// ---
@@ -1825,10 +2013,13 @@ version (WASI) {
 std.typecons.Nullable!size_t readBody(ref Fetch f, char[] into) {
 	if (f.state != State.failed && buffered(f) == 0 && f.state != State.done) cast(void) poll(f);
 	if (f.state == State.failed || (f.state == State.done && buffered(f) == 0)) return typeof(return).init;
-	return typeof(return)(take(f, into));
+	immutable taken = take(f, into);
+	assert(taken <= into.length, "bc.http.readBody: took more than there was room for");
+	return typeof(return)(taken);
 }
 
-/// Starts fetching `r` and waits until its response's head has arrived or it has failed; then `f.status` and `f.headers` are set. Read the body with `readAll` or `readBody`.
+/// Starts fetching `r` and waits until its response's head has arrived or it has failed; then `f.status` and `f.headers` are set.
+/// Read the body with `readAll` or `readBody`.
 ///
 /// Returns an empty `Nullable` only if an allocation was refused; otherwise check the fetch's `state`.
 ///
@@ -1844,6 +2035,7 @@ std.typecons.Nullable!Fetch fetch(ref const Request r) {
 	if (f.isNull) return f;
 	Fetch*[1] fs = [&f.get()];
 	while (poll(f.get) == State.pending) cast(void) wait(fs[], -1);
+	assert(f.get.state != State.pending, "bc.http.fetch: returned before the head or a failure");
 	return f;
 }
 
@@ -1852,7 +2044,8 @@ struct Body {
 	const(char)[] content; /// The body's bytes, belonging to the `Fetch` they were read from.
 }
 
-/// Waits for the rest of `f`'s body and returns all of it that `readBody` had not taken. It belongs to `f`, valid until `free(f)`, and calling this again returns it again.
+/// Waits for the rest of `f`'s body and returns all of it that `readBody` had not taken.
+/// It belongs to `f`, valid until `free(f)`, and calling this again returns it again.
 ///
 /// Returns an empty `Nullable` if `f` failed; if an allocation was refused, it fails `f` with `Failure.outOfMemory` first.
 ///
@@ -1874,7 +2067,9 @@ std.typecons.Nullable!Body readAll(ref Fetch f) @trusted {
 			return typeof(return).init;
 		}
 		auto got = readBody(f, f.whole[kept .. kept + chunk]);
+		assert(got.isNull || got.get <= chunk, "bc.http.readAll: read more than one chunk");
 		cast(void) fp.dynarray.removeLast(f.whole, got.isNull ? chunk : chunk - got.get);
+		assert(fp.dynarray.length(f.whole) >= kept, "bc.http.readAll: lost body bytes already read");
 		if (got.isNull) return f.state == State.done ? typeof(return)(Body(fp.dynarray.slice(f.whole))) : typeof(return).init;
 		if (got.get == 0) cast(void) wait(fs[], -1);
 	}

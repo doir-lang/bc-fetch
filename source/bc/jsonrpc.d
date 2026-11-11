@@ -28,7 +28,12 @@ static import fp.io;
 
 // --- reading -----------------------------------------------------------------
 
-/// Reads framed messages from `fd`. Plain data, released by `free`; it does not close `fd`. On Windows, reading puts `fd` in binary mode, as `fp.io.readSome` does, so the C runtime does not translate line ends.
+/// The longest message body `next` accepts; a `Content-Length` past it closes the reader rather than ask for that much memory.
+enum size_t maxBodyBytes = size_t(1) << 30;
+
+/// Reads framed messages from `fd`.
+/// Plain data, released by `free`; it does not close `fd`.
+/// On Windows, reading puts `fd` in binary mode, as `fp.io.readSome` does, so the C runtime does not translate line ends.
 struct Reader {
 	int fd; /// Where messages come from.
 	bool closed; /// Set once `fd` has ended or failed, or an allocation was refused.
@@ -44,6 +49,7 @@ struct Reader {
 /// free(r);
 /// ---
 void free(ref Reader r) {
+	assert(r.start <= fp.dynarray.length(r.buffer), "bc.jsonrpc: a reader's start past its buffer");
 	fp.dynarray.free(r.buffer);
 	r.buffer = null;
 	r.start = 0;
@@ -52,6 +58,7 @@ void free(ref Reader r) {
 // Where a message's body starts in its reader's buffer, and how long it is.
 private struct Frame {
 	size_t bodyStart, bodyLength;
+	bool oversized; // its length passed `maxBodyBytes`, so its body is never read
 }
 
 // The frame of the message at `r.start`, whose body may not be buffered yet; null until its header is.
@@ -70,17 +77,21 @@ private std.typecons.Nullable!Frame framed(ref const Reader r) @trusted {
 			foreach (c; header[field.length .. $]) {
 				if (c == ' ') continue;
 				if (c < '0' || c > '9') break;
-				bodyLength = bodyLength * 10 + (c - '0');
+				// Clamped past the limit, so digits from the peer cannot overflow it.
+				bodyLength = bodyLength > maxBodyBytes ? bodyLength : bodyLength * 10 + (c - '0');
 			}
 		}
+		assert(stop <= end, "bc.jsonrpc: a header line past the header block");
 		line = stop + 2;
 	}
-	return typeof(return)(Frame(r.start + end + 4, bodyLength));
+	assert(r.start + end + 4 <= fp.dynarray.length(r.buffer), "bc.jsonrpc: a header block past what was read");
+	return typeof(return)(Frame(r.start + end + 4, bodyLength, bodyLength > maxBodyBytes));
 }
 
 // Whether the whole of the message `frame` describes is in `r.buffer`.
 private bool arrived(ref const Reader r, std.typecons.Nullable!Frame frame) {
-	return !frame.isNull && frame.get.bodyStart + frame.get.bodyLength <= fp.dynarray.length(r.buffer);
+	assert(frame.isNull || frame.get.oversized || frame.get.bodyLength <= maxBodyBytes, "bc.jsonrpc: a frame past the limit not marked so");
+	return !frame.isNull && !frame.get.oversized && frame.get.bodyStart + frame.get.bodyLength <= fp.dynarray.length(r.buffer);
 }
 
 /// Whether a whole message is already buffered, so `next` would not wait: a server drains a burst of edits before answering any.
@@ -109,8 +120,10 @@ const(char)[] next(ref Reader r) @trusted {
 			immutable frame = framed(r);
 			if (arrived(r, frame)) {
 				r.start = frame.get.bodyStart + frame.get.bodyLength;
+				assert(r.start <= fp.dynarray.length(r.buffer), "bc.jsonrpc: a message past what was read");
 				return r.buffer[frame.get.bodyStart .. r.start];
 			}
+			if (!frame.isNull && frame.get.oversized) r.closed = true;
 		}
 		if (r.closed) return null;
 		// What was handed out goes before more is read, so the buffer holds one message at most plus what follows it.
@@ -127,6 +140,7 @@ const(char)[] next(ref Reader r) @trusted {
 			immutable frame = framed(r);
 			if (!frame.isNull && frame.get.bodyStart + frame.get.bodyLength - kept > chunk) size = frame.get.bodyStart + frame.get.bodyLength - kept;
 		}
+		assert(size <= maxBodyBytes + chunk, "bc.jsonrpc: reading room past the body limit");
 		if (fp.dynarray.growToSize(r.buffer, kept + size) is null) {
 			r.closed = true;
 			return null;
@@ -134,13 +148,15 @@ const(char)[] next(ref Reader r) @trusted {
 		immutable got = fp.io.readSome(r.fd, r.buffer[kept .. kept + size]);
 		cast(void) fp.dynarray.removeLast(r.buffer, size - (got > 0 ? got : 0));
 		if (got <= 0) r.closed = true;
+		assert(fp.dynarray.length(r.buffer) == kept + (got > 0 ? got : 0), "bc.jsonrpc: kept other than what was read");
 	}
 }
 
 
 // --- writing -----------------------------------------------------------------
 
-/// Writes `body` to `fd` as one message, its `Content-Length` header first. On Windows it puts `fd` in binary mode first, as reading does.
+/// Writes `body` to `fd` as one message, its `Content-Length` header first.
+/// On Windows it puts `fd` in binary mode first, as reading does.
 ///
 /// Returns false if `fd` fails, perhaps partway through the message.
 ///
@@ -152,8 +168,10 @@ bool send(int fd, const(char)[] body) {
 	char[48] header = "Content-Length: ";
 	size_t at = 16;
 	char[fp.string.numbers.maxDecimalLength] digits;
+	assert(body.length <= maxBodyBytes, "bc.jsonrpc.send: a body longer than a reader accepts");
 	foreach (c; fp.string.numbers.formatUnsigned(body.length, digits)) header[at++] = c;
 	foreach (c; "\r\n\r\n") header[at++] = c;
+	assert(at <= header.length, "bc.jsonrpc.send: a header past its buffer");
 	return fp.io.writeAll(fd, header[0 .. at]) && fp.io.writeAll(fd, body);
 }
 
@@ -243,6 +261,24 @@ unittest { // messages split across writes and run together come out whole and i
 		scope(exit) free(translated);
 		assert(next(translated) == "a\r\nb\nc");
 	}
+
+	// A length past the limit closes the reader, however many digits it has, without reading its body.
+	immutable huge = scratch();
+	assert(huge >= 0);
+	scope(exit) cast(void) fp.io.close(huge);
+	static immutable oversized = "Content-Length: 99999999999999999999999999\r\n\r\n{}";
+	assert(fp.io.writeAll(huge, oversized) && rewind(huge));
+	Reader refused = Reader(huge);
+	scope(exit) free(refused);
+	assert(next(refused) is null && refused.closed);
+	assert(fp.dynarray.capacity(refused.buffer) < (1 << 17)); // no room was asked for the claimed body
+	immutable past = scratch();
+	assert(past >= 0);
+	scope(exit) cast(void) fp.io.close(past);
+	assert(fp.io.writeAll(past, "Content-Length: 17179869184\r\n\r\n{}") && rewind(past));
+	Reader tooLong = Reader(past);
+	scope(exit) free(tooLong);
+	assert(next(tooLong) is null && tooLong.closed && fp.dynarray.capacity(tooLong.buffer) < (1 << 17));
 
 	// No room to read into closes the reader.
 	static import fp.testing;

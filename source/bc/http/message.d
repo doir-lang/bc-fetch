@@ -1,4 +1,5 @@
-/// HTTP/1.1 messages without I/O: parse a URL, write a request head, and read a response head and body from bytes the caller has already received. Nothing here touches a socket, so a client can drive it from any event loop.
+/// HTTP/1.1 messages without I/O: parse a URL, write a request head, and read a response head and body from bytes the caller has already received.
+/// Nothing here touches a socket, so a client can drive it from any event loop.
 ///
 /// Examples:
 /// ---
@@ -129,10 +130,13 @@ std.typecons.Nullable!Url parseUrl(const(char)[] text) {
 		if (n.isNull || n.get.value > ushort.max) return none;
 		u.port = cast(ushort) n.get.value;
 	} else u.port = fp.string.ascii.equalIgnoringCase(u.scheme, "http") ? 80 : fp.string.ascii.equalIgnoringCase(u.scheme, "https") ? 443 : 0;
+	assert(u.host.length && u.host.length <= u.authority.length, "bc.http.message: a URL's host outside its authority");
+	assert(u.target.length == 0 || u.target[0] == '/' || u.target[0] == '?', "bc.http.message: a request target that is neither a path nor a query");
 	return typeof(return)(u);
 }
 
-/// `text` as a new fp string with each `%` and two hexadecimal digits replaced by the byte they name, as a URL or a `file://` URI writes the characters it reserves; a `%` not followed by two hexadecimal digits is kept as written. An empty `text` gives null.
+/// `text` as a new fp string with each `%` and two hexadecimal digits replaced by the byte they name, as a URL or a `file://` URI writes the characters it reserves; a `%` not followed by two hexadecimal digits is kept as written.
+/// An empty `text` gives null.
 ///
 /// Returns an empty `Nullable` if an allocation was refused.
 ///
@@ -145,6 +149,7 @@ std.typecons.Nullable!Url parseUrl(const(char)[] text) {
 /// ---
 std.typecons.Nullable!(char*) percentDecoded(const(char)[] text) {
 	char* out_ = null;
+	assert(text.ptr !is null || text.length == 0, "bc.http.message: text with a length but no bytes");
 	for (size_t i = 0; i < text.length;) {
 		char c = text[i];
 		size_t step = 1;
@@ -158,6 +163,7 @@ std.typecons.Nullable!(char*) percentDecoded(const(char)[] text) {
 		}
 		i += step;
 	}
+	assert(fp.string.length(out_) <= text.length && fp.string.length(out_) * 3 >= text.length, "bc.http.message.percentDecoded: a length no decoding gives");
 	return typeof(return)(out_);
 }
 
@@ -165,7 +171,8 @@ std.typecons.Nullable!(char*) percentDecoded(const(char)[] text) {
 // --- writing requests --------------------------------------------------------
 
 // Appends every piece to `out_`, or nothing if it cannot grow.
-/// Appends the request line `method target HTTP/1.1` to the fp dynarray `out_`, writing `target` as `/` when it is empty and putting `/` before it when it starts with `?`. It does not check `method` or `target`; `parseUrl` already refuses a target that would break the line.
+/// Appends the request line `method target HTTP/1.1` to the fp dynarray `out_`, writing `target` as `/` when it is empty and putting `/` before it when it starts with `?`.
+/// It does not check `method` or `target`; `parseUrl` already refuses a target that would break the line.
 ///
 /// Returns false if `out_` could not grow, leaving it as it was.
 ///
@@ -178,11 +185,14 @@ std.typecons.Nullable!(char*) percentDecoded(const(char)[] text) {
 /// assert(fp.dynarray.slice(out_) == "POST /?q HTTP/1.1\r\n");
 /// ---
 bool writeRequestLine(ref char* out_, const(char)[] method, const(char)[] target) {
+	assert(validName(method), "bc.http.message.writeRequestLine: a method that is not a token");
+	assert(validValue(target), "bc.http.message.writeRequestLine: a target holding control characters would split the request");
 	return fp.string.append(out_, method, " ", target.length == 0 || target[0] == '?' ? "/" : "", target, " HTTP/1.1\r\n");
 }
 
 // wrapper: names an HTTP head's format, or the struct over its fields
-/// Appends the field `name: value` to the fp dynarray `out_`. It does not check them; see `validName` and `validValue`.
+/// Appends the field `name: value` to the fp dynarray `out_`.
+/// It does not check them; see `validName` and `validValue`.
 ///
 /// Returns false if `out_` could not grow, leaving it as it was.
 ///
@@ -195,6 +205,8 @@ bool writeRequestLine(ref char* out_, const(char)[] method, const(char)[] target
 /// assert(fp.dynarray.slice(out_) == "Accept: */*\r\n");
 /// ---
 bool writeField(ref char* out_, const(char)[] name, const(char)[] value) {
+	assert(validName(name), "bc.http.message.writeField: a field name that is not a token");
+	assert(validValue(value), "bc.http.message.writeField: a field value holding a line break would inject a field");
 	return fp.string.append(out_, name, ": ", value, "\r\n");
 }
 
@@ -211,6 +223,7 @@ bool writeField(ref char* out_, const(char)[] name, const(char)[] value) {
 /// assert(endHead(out_) && fp.dynarray.slice(out_) == "\r\n");
 /// ---
 bool endHead(ref char* out_) {
+	assert(out_ is null || fp.string.endsWith(out_, "\r\n"), "bc.http.message.endHead: ending a head whose last line is unfinished");
 	return fp.string.append(out_, "\r\n");
 }
 
@@ -248,9 +261,12 @@ struct Head {
 
 // The name and value of the field line `line`, which must hold a colon.
 private Header field(const(char)[] line) {
+	assert(fp.string.contains(line, ':'), "bc.http.message: a field line without a colon");
 	size_t colon = 0;
 	while (line[colon] != ':') ++colon;
-	return Header(line[0 .. colon], fp.string.trim(line[colon + 1 .. $], " \t"));
+	auto parsed = Header(line[0 .. colon], fp.string.trim(line[colon + 1 .. $], " \t"));
+	assert(parsed.name.length + 1 + parsed.value.length <= line.length, "bc.http.message: a field longer than its line");
+	return parsed;
 }
 
 /// The field lines of a head, as a range of `Header`s in the order they arrived.
@@ -274,6 +290,8 @@ struct Fields {
 	/// assert(fieldsOf(parseHead("HTTP/1.1 200 OK\r\nA: 1\r\n\r\n", "GET")).front == Header("A", "1"));
 	/// ---
 	Header front() const @nogc nothrow {
+		assert(!empty, "bc.http.message: front of finished fields");
+		assert(fp.string.contains(rest, "\r\n"), "bc.http.message: a field line without its CRLF");
 		size_t end = 0;
 		while (rest[end] != '\r') ++end;
 		return field(rest[0 .. end]);
@@ -288,9 +306,12 @@ struct Fields {
 	/// assert(f.front.name == "B");
 	/// ---
 	void popFront() @nogc nothrow {
+		assert(!empty, "bc.http.message: popFront of finished fields");
+		immutable before = rest.length;
 		size_t end = 0;
 		while (rest[end] != '\r') ++end;
 		rest = rest[end + 2 .. $];
+		assert(rest.length < before, "bc.http.message: a field that did not advance");
 	}
 }
 
@@ -308,10 +329,13 @@ struct Fields {
 /// assert(f.empty);
 /// ---
 Fields fieldsOf(const Head h) {
+	assert(h.progress == Progress.ok, "bc.http.message: the fields of a head that did not parse");
+	assert(h.fields.length == 0 || fp.string.endsWith(h.fields, "\r\n"), "bc.http.message: fields that do not end their last line");
 	return Fields(h.fields);
 }
 
-/// Reads a response head from the start of `bytes`, the response to a `method` request, and works out how its body is framed. A 1xx status other than 101 is an interim response: skip its `size` bytes and read the next head.
+/// Reads a response head from the start of `bytes`, the response to a `method` request, and works out how its body is framed.
+/// A 1xx status other than 101 is an interim response: skip its `size` bytes and read the next head.
 ///
 /// Its `progress` is `Progress.needMore` until `bytes` holds the whole head, and `Progress.malformed` if the head is not HTTP/1.1, is longer than `maxHeadSize`, or gives a `Content-Length` that is not one number; only with `Progress.ok` are the other members set.
 ///
@@ -341,6 +365,7 @@ Head parseHead(const(char)[] bytes, const(char)[] method) {
 	if (line.length < 12 || line[0 .. 7] != "HTTP/1." || line[7] < '0' || line[7] > '9' || line[8] != ' ' || (line.length > 12 && line[12] != ' ')) return h;
 	auto parsedStatus = fp.string.numbers.parseUnsigned(line[9 .. 12]);
 	if (parsedStatus.isNull) return h;
+	assert(parsedStatus.get.value <= 999, "bc.http.message: three digits above 999");
 	immutable status = cast(ushort) parsedStatus.get.value;
 	h.status = status;
 	h.reason = line.length > 12 ? line[13 .. $] : null;
@@ -380,6 +405,7 @@ Head parseHead(const(char)[] bytes, const(char)[] method) {
 		h.length = length;
 	} else h.framing = Framing.close;
 	h.progress = Progress.ok;
+	assert(h.size <= bytes.length && h.size <= maxHeadSize && h.status <= 999, "bc.http.message: a head larger than what was read, or than the limit");
 	return h;
 }
 
@@ -388,7 +414,8 @@ enum size_t maxLineSize = 1 << 12;
 
 private enum Step : ubyte { size, data, dataEnd, trailer, done }
 
-/// Where `decode` is in a response's body. Plain data; make it with `bodyOf`.
+/// Where `decode` is in a response's body.
+/// Plain data; make it with `bodyOf`.
 struct Body {
 	Framing framing; /// How the body ends.
 	ulong remaining; /// Body bytes left: of the whole body for `Framing.length`, or of the current chunk for `Framing.chunked`.
@@ -403,12 +430,16 @@ struct Body {
 /// assert(b.ended);
 /// ---
 Body bodyOf(const Head h) {
+	assert(h.progress == Progress.ok, "bc.http.message: the body of a head that did not parse");
+	assert(h.framing == Framing.length || h.length == 0, "bc.http.message: a length on a body framed otherwise");
 	Body b = Body(h.framing, h.length);
 	if (h.framing == Framing.none || (h.framing == Framing.length && h.length == 0)) b.step = Step.done;
+	assert(b.step == Step.size || b.step == Step.done, "bc.http.message: a body that starts partway");
 	return b;
 }
 
-/// Whether all of `b`'s body has been decoded. A body framed by `Framing.close` never ends here: it ends when the connection does.
+/// Whether all of `b`'s body has been decoded.
+/// A body framed by `Framing.close` never ends here: it ends when the connection does.
 ///
 /// Examples:
 /// ---
@@ -427,34 +458,10 @@ struct Decoded {
 	bool malformed; /// The chunked framing was not HTTP/1.1; nothing more can be read.
 }
 
-/// Decodes `bytes`, the next received bytes of `b`'s body, in place: the body bytes among them are moved to their start, so chunk framing is removed without a second buffer. It stops where the body ends, leaving any bytes after it unused, and before a partial chunk-size line, which needs more bytes.
-///
-/// Its `malformed` is set if the chunk framing is broken or a chunk-size or trailer line is longer than `maxLineSize`; `b` is then left where it was.
-///
-/// Examples:
-/// ---
-/// char[17] bytes = "3\r\nabc\r\n0\r\n\r\nnext";
-/// Body b = Body(Framing.chunked);
-/// auto d = decode(b, bytes[]);
-/// assert(bytes[0 .. d.produced] == "abc" && d.used == 13 && b.ended);
-/// ---
-Decoded decode(ref Body b, char[] bytes) @trusted {
+// `decode` for a chunked body: moves each chunk's data down over the framing before it, as far as whole size lines and chunk ends reach.
+private Decoded decodeChunked(ref Body b, char[] bytes) @trusted {
+	assert(b.framing == Framing.chunked, "bc.http.message: chunked decoding of a body framed otherwise");
 	Decoded d;
-	final switch (b.framing) {
-	case Framing.none:
-		return d;
-	case Framing.close:
-		d.used = d.produced = bytes.length;
-		return d;
-	case Framing.length:
-		immutable n = b.remaining < bytes.length ? cast(size_t) b.remaining : bytes.length;
-		b.remaining -= n;
-		if (b.remaining == 0) b.step = Step.done;
-		d.used = d.produced = n;
-		return d;
-	case Framing.chunked:
-		break;
-	}
 	immutable saved = b;
 	size_t i = 0, o = 0;
 	for (;;) {
@@ -474,6 +481,7 @@ Decoded decode(ref Body b, char[] bytes) @trusted {
 			}
 			auto line = bytes[i .. nl];
 			if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
+			assert(line.length <= maxLineSize, "bc.http.message: a chunk line past maxLineSize");
 			i = nl + 1;
 			if (b.step == Step.trailer) {
 				if (line.length == 0) b.step = Step.done;
@@ -489,6 +497,7 @@ Decoded decode(ref Body b, char[] bytes) @trusted {
 		case Step.data:
 			immutable n = b.remaining < bytes.length - i ? cast(size_t) b.remaining : bytes.length - i;
 			// The output trails the input, so the move is forward; slice copies refuse overlap.
+			assert(o <= i && i + n <= bytes.length);
 			core.stdc.string.memmove(bytes.ptr + o, bytes.ptr + i, n);
 			i += n;
 			o += n;
@@ -508,6 +517,7 @@ Decoded decode(ref Body b, char[] bytes) @trusted {
 			}
 			if (bytes[i .. i + 2] != "\r\n") goto broken;
 			i += 2;
+			assert(b.remaining == 0, "bc.http.message: a chunk ended with data left");
 			b.step = Step.size;
 			break;
 		}
@@ -515,6 +525,41 @@ Decoded decode(ref Body b, char[] bytes) @trusted {
 broken:
 	b = saved;
 	return Decoded(0, 0, true);
+}
+
+/// Decodes `bytes`, the next received bytes of `b`'s body, in place: the body bytes among them are moved to their start, so chunk framing is removed without a second buffer.
+/// It stops where the body ends, leaving any bytes after it unused, and before a partial chunk-size line, which needs more bytes.
+///
+/// Its `malformed` is set if the chunk framing is broken or a chunk-size or trailer line is longer than `maxLineSize`; `b` is then left where it was.
+///
+/// Examples:
+/// ---
+/// char[17] bytes = "3\r\nabc\r\n0\r\n\r\nnext";
+/// Body b = Body(Framing.chunked);
+/// auto d = decode(b, bytes[]);
+/// assert(bytes[0 .. d.produced] == "abc" && d.used == 13 && b.ended);
+/// ---
+Decoded decode(ref Body b, char[] bytes) @trusted {
+	Decoded d;
+	final switch (b.framing) {
+	case Framing.none:
+		break;
+	case Framing.close:
+		d.used = d.produced = bytes.length;
+		break;
+	case Framing.length:
+		immutable n = b.remaining < bytes.length ? cast(size_t) b.remaining : bytes.length;
+		b.remaining -= n;
+		if (b.remaining == 0) b.step = Step.done;
+		d.used = d.produced = n;
+		break;
+	case Framing.chunked:
+		d = decodeChunked(b, bytes);
+		break;
+	}
+	assert(d.produced <= d.used && d.used <= bytes.length, "bc.http.message: decoding claimed bytes it was not given");
+	assert(!ended(b) || b.framing != Framing.length || b.remaining == 0);
+	return d;
 }
 
 
@@ -651,4 +696,73 @@ unittest { // decoding bodies: by length, to the connection's close, and chunked
 	char[maxLineSize + 2] longLine = '0';
 	b = Body(Framing.chunked);
 	assert(decode(b, longLine[]).malformed);
+}
+
+unittest { // seeded: a chunked body decodes the same whole or split at any bytes, and one with a damaged byte ends the same way either way
+	static import fp.algorithms;
+	enum size_t most = 1 << 13;
+	static char[most] body_, wire, whole, pending, split;
+	auto random = fp.algorithms.createRandom(1971);
+
+	// Decodes `wire[0 .. length]` fed in pieces of up to `piece` bytes into `split`, as a connection's reads arrive.
+	static Decoded feed(ref fp.algorithms.Random random, size_t length, size_t piece, ref bool ended) {
+		Body b = Body(Framing.chunked);
+		size_t fed = 0, held = 0, produced = 0;
+		while (fed < length && !b.ended) {
+			immutable more = 1 + fp.algorithms.randomBelow(random, piece);
+			immutable taken = more < length - fed ? more : length - fed;
+			core.stdc.string.memcpy(pending.ptr + held, wire.ptr + fed, taken);
+			fed += taken;
+			held += taken;
+			auto d = decode(b, pending[0 .. held]);
+			if (d.malformed) return d;
+			core.stdc.string.memcpy(split.ptr + produced, pending.ptr, d.produced);
+			produced += d.produced;
+			core.stdc.string.memmove(pending.ptr, pending.ptr + d.used, held - d.used);
+			held -= d.used;
+		}
+		ended = b.ended;
+		return Decoded(fed - held, produced, false);
+	}
+
+	size_t damaged = 0, malformed = 0;
+	foreach (round; 0 .. 400) {
+		size_t length = 0, written = 0;
+		foreach (chunk; 0 .. fp.algorithms.randomBelow(random, 6)) {
+			immutable size = 1 + fp.algorithms.randomBelow(random, round % 9 == 0 ? 700 : 40);
+			char* line = fp.string.format("%zx%s\r\n", size, fp.algorithms.randomChance(random, 1, 4) ? ";name=value".ptr : "".ptr).get(null);
+			assert(line !is null);
+			core.stdc.string.memcpy(wire.ptr + length, line, fp.string.length(line));
+			length += fp.string.length(line);
+			fp.string.free(line);
+			foreach (i; 0 .. size) body_[written + i] = wire[length + i] = cast(char) ('a' + fp.algorithms.randomBelow(random, 26));
+			written += size;
+			length += size;
+			core.stdc.string.memcpy(wire.ptr + length, "\r\n".ptr, 2);
+			length += 2;
+		}
+		const(char)[] tail = fp.algorithms.randomChance(random, 1, 3) ? "0\r\nTrailer: yes\r\n\r\n" : "0\r\n\r\n";
+		core.stdc.string.memcpy(wire.ptr + length, tail.ptr, tail.length);
+		length += tail.length;
+		immutable intact = !fp.algorithms.randomChance(random, 1, 3);
+		if (!intact) {
+			++damaged;
+			wire[fp.algorithms.randomBelow(random, length)] = "\r\n;0gz "[fp.algorithms.randomBelow(random, 7)];
+		}
+
+		core.stdc.string.memcpy(whole.ptr, wire.ptr, length);
+		Body b = Body(Framing.chunked);
+		immutable once = decode(b, whole[0 .. length]);
+		assert(!intact || (!once.malformed && b.ended && once.used == length && whole[0 .. once.produced] == body_[0 .. written]));
+		malformed += once.malformed;
+		static immutable size_t[3] pieces = [1, 7, 300];
+		foreach (piece; pieces) {
+			bool ended;
+			immutable pieced = feed(random, length, piece, ended);
+			assert(pieced.malformed == once.malformed);
+			if (once.malformed) continue;
+			assert(ended == b.ended && pieced.used == once.used && split[0 .. pieced.produced] == whole[0 .. once.produced]);
+		}
+	}
+	assert(damaged > 50 && malformed > 10 && malformed < damaged);
 }

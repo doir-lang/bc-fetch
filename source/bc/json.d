@@ -1,4 +1,6 @@
-/// JSON for `-betterC`, which has no Phobos. A `Document` is minified JSON text with an index of its values over it: `parse` reads one, `set`, `append`, `insert`, `replace` and `remove` edit it in place, `json` gives its text and `pretty` lays that out for reading. A `Value` names one value of a document, stays valid across edits until the document is freed, and reads as missing once its value is removed; look further in with `v["key"]` and `v[i]`.
+/// JSON for `-betterC`, which has no Phobos.
+/// A `Document` is minified JSON text with an index of its values over it: `parse` reads one, `set`, `append`, `insert`, `replace` and `remove` edit it in place, `json` gives its text and `pretty` lays that out for reading.
+/// A `Value` names one value of a document, stays valid across edits until the document is freed, and reads as missing once its value is removed; look further in with `v["key"]` and `v[i]`.
 ///
 /// Examples:
 /// ---
@@ -36,7 +38,9 @@ static import fp.string.utf;
 /// What a value is: `missing` for a `Value` that names none.
 enum Kind : ubyte { missing, null_, false_, true_, number, string_, array, object }
 
-/// One value of a document, in preorder after its container, so its next sibling is `nodes[i].skip`. An object's members are a key `string_` node followed by its value. Its bytes in the document's `text` are its JSON, a string's quotes and escapes included.
+/// One value of a document, in preorder after its container, so its next sibling is `nodes[i].skip`.
+/// An object's members are a key `string_` node followed by its value.
+/// Its bytes in the document's `text` are its JSON, a string's quotes and escapes included.
 struct Node {
 	Kind kind; /// What it is; never `missing`.
 	uint start; /// Its first byte.
@@ -46,7 +50,8 @@ struct Node {
 	uint parent; /// Its container's id, or `uint.max` for the root.
 }
 
-/// A JSON document: its minified text and its values in preorder over it, the first the root. Plain data, released by `free`; `Document.init` is empty and has no root.
+/// A JSON document: its minified text and its values in preorder over it, the first the root.
+/// Plain data, released by `free`; `Document.init` is empty and has no root.
 struct Document {
 	char* text = null; /// Its JSON, minified, as an fp dynarray.
 	Node* nodes = null; /// Its values in preorder, an fp dynarray.
@@ -78,6 +83,7 @@ private void release(ref Fragment f) {
 /// assert(p.document.nodes is null && json(p.document).length == 0);
 /// ---
 void free(ref Document d) {
+	assert(fp.dynarray.length(d.ids) >= fp.dynarray.length(d.nodes) || d.ids is null, "bc.json: a document with fewer ids than nodes");
 	fp.dynarray.free(d.text);
 	fp.dynarray.free(d.nodes);
 	fp.dynarray.free(d.ids);
@@ -87,7 +93,9 @@ void free(ref Document d) {
 
 // The node index `id` names in `d`, or `dead`.
 private uint indexOf(const(Document)* d, uint id) {
-	return d is null || id >= fp.dynarray.length(d.ids) ? dead : d.ids[id];
+	immutable index = d is null || id >= fp.dynarray.length(d.ids) ? dead : d.ids[id];
+	assert(index == dead || (index < fp.dynarray.length(d.nodes) && d.nodes[index].id == id), "bc.json: an id naming a node that does not name it back");
+	return index;
 }
 
 
@@ -95,7 +103,9 @@ private uint indexOf(const(Document)* d, uint id) {
 
 // The four hexadecimal digits at `s[at]` as a number, or `uint.max` if they are not all digits.
 private uint hexDigits(const(char)[] s, size_t at) {
+	assert(at + 4 <= s.length, "bc.json: four hexadecimal digits past the text");
 	auto parsed = fp.string.numbers.parseUnsigned(s[at .. at + 4], 16);
+	assert(parsed.isNull || parsed.get.value <= 0xFFFF, "bc.json: four hexadecimal digits above 0xFFFF");
 	return parsed.isNull ? uint.max : cast(uint) parsed.get.value;
 }
 
@@ -108,6 +118,8 @@ private struct Unescaped {
 
 // Decodes the escape at `s[i]`, a surrogate pair to one character and a broken `\u` or lone surrogate to U+FFFD.
 private Unescaped unescape(const(char)[] s, size_t i) {
+	assert(i < s.length && s[i] == '\\', "bc.json: unescaping something that is not an escape");
+	immutable escape = i;
 	Unescaped u;
 	immutable c = i + 1 < s.length ? s[i + 1] : '\\';
 	i += 2;
@@ -135,6 +147,8 @@ private Unescaped unescape(const(char)[] s, size_t i) {
 		default: u.bytes[0] = c;
 	}
 	u.next = i;
+	assert(u.length >= 1 && u.length <= u.bytes.length, "bc.json: an escape decoded to no bytes or too many");
+	assert(u.next >= escape + 2 && u.next <= escape + 12, "bc.json: an escape longer than a surrogate pair, or shorter than two bytes");
 	return u;
 }
 
@@ -151,15 +165,19 @@ private bool keyEquals(const(char)[] raw, const(char)[] name) {
 		immutable u = unescape(raw, i);
 		if (name.length - at < u.length || name[at .. at + u.length] != u.bytes[0 .. u.length]) return false;
 		at += u.length;
+		assert(u.next > i, "bc.json: an escape that did not advance");
 		i = u.next;
 	}
+	assert(at <= name.length, "bc.json: matched past the name");
 	return at == name.length;
 }
 
 
 // --- values ------------------------------------------------------------------
 
-/// One value of a document, or none: a `missing` value, which every lookup through it gives too. It stays valid across edits until its document is freed, and is missing once its value is removed. Plain data; it does not own its document, which must not move while it is used.
+/// One value of a document, or none: a `missing` value, which every lookup through it gives too.
+/// It stays valid across edits until its document is freed, and is missing once its value is removed.
+/// Plain data; it does not own its document, which must not move while it is used.
 struct Value {
 @nogc nothrow:
 	Document* document; /// The document it is in.
@@ -178,7 +196,9 @@ struct Value {
 		immutable o = indexOf(document, id);
 		if (o == dead || document.nodes[o].kind != Kind.object) return Value(document);
 		for (uint k = o + 1; k < document.nodes[o].skip; k = document.nodes[k + 1].skip) {
+			assert(k + 1 < document.nodes[o].skip, "bc.json: an object key without its value");
 			immutable key = document.nodes[k];
+			assert(key.kind == Kind.string_ && key.end - key.start >= 2, "bc.json: an object key that is not a string");
 			if (keyEquals(document.text[key.start + 1 .. key.end - 1], name)) return Value(document, document.nodes[k + 1].id);
 		}
 		return Value(document);
@@ -196,7 +216,11 @@ struct Value {
 		immutable a = indexOf(document, id);
 		if (a == dead || document.nodes[a].kind != Kind.array) return Value(document);
 		uint e = a + 1;
-		for (; e < document.nodes[a].skip && i; --i) e = document.nodes[e].skip;
+		for (; e < document.nodes[a].skip && i; --i) {
+			assert(document.nodes[e].skip > e, "bc.json: an element that does not skip past itself");
+			e = document.nodes[e].skip;
+		}
+		assert(e <= document.nodes[a].skip, "bc.json: an element past its array");
 		return e < document.nodes[a].skip ? Value(document, document.nodes[e].id) : Value(document);
 	}
 }
@@ -230,17 +254,21 @@ private struct Parse {
 }
 
 private void space(ref Parse p) {
+	immutable from = p.at;
 	// JSON whitespace is only these four, not every ASCII whitespace character.
 	p.at = p.text.length - fp.string.trimStart(p.text[p.at .. $], " \t\n\r").length;
+	assert(p.at >= from && p.at <= p.text.length, "bc.json: skipping space moved backwards or past the text");
 }
 
 private bool literal(ref Parse p, const(char)[] word) {
+	assert(word.length > 0 && p.at <= p.text.length, "bc.json: an empty literal, or reading past the text");
 	if (p.text.length - p.at < word.length || p.text[p.at .. p.at + word.length] != word) return false;
 	p.at += word.length;
 	return true;
 }
 
 private bool stringEnd(ref Parse p) {
+	assert(p.at < p.text.length && p.text[p.at] == '"', "bc.json: a string that does not open with a quote");
 	++p.at;
 	while (p.at < p.text.length) {
 		immutable c = p.text[p.at];
@@ -259,16 +287,20 @@ private bool numberEnd(ref Parse p) {
 	if (p.at < p.text.length && p.text[p.at] == '-') ++p.at;
 	immutable digits = p.at;
 	while (p.at < p.text.length && ((p.text[p.at] >= '0' && p.text[p.at] <= '9') || p.text[p.at] == '.' || p.text[p.at] == 'e' || p.text[p.at] == 'E' || p.text[p.at] == '+' || p.text[p.at] == '-')) ++p.at;
+	assert(p.at >= digits && digits >= start && p.at <= p.text.length, "bc.json: a number read backwards or past the text");
 	return p.at > digits && p.at > start;
 }
 
 // Copies `bytes` into the document's text, which was sized for all of the input, so never grows.
 private void emit(ref Parse p, const(char)[] bytes) {
+	assert(p.written + bytes.length <= fp.dynarray.length(p.document.text), "bc.json: minified text longer than its input");
 	if (bytes.length) core.stdc.string.memcpy(p.document.text + p.written, bytes.ptr, bytes.length);
 	p.written += bytes.length;
 }
 
-// One value at `p.at`, appended minified with its descendants, inside node `parent`. False if malformed or refused.
+// bounded: maxDepth, which `p.depth` is checked against
+// One value at `p.at`, appended minified with its descendants, inside node `parent`.
+// False if malformed or refused.
 private bool value(ref Parse p, uint parent) {
 	space(p);
 	if (p.at >= p.text.length || p.depth > maxDepth) return false;
@@ -327,10 +359,13 @@ private bool value(ref Parse p, uint parent) {
 	node.kind = kind;
 	node.end = cast(uint) p.written;
 	node.skip = cast(uint) fp.dynarray.length(p.document.nodes);
+	assert(node.end > node.start && node.skip > index, "bc.json: a value of no bytes, or one that does not skip past itself");
+	assert(p.depth <= maxDepth, "bc.json: nested past maxDepth");
 	return true;
 }
 
-/// Parses `text`, one JSON value with whitespace around it, into a new document holding it minified; `text` need not outlive it. Containers may nest 129 deep.
+/// Parses `text`, one JSON value with whitespace around it, into a new document holding it minified; `text` need not outlive it.
+/// Containers may nest 129 deep.
 ///
 /// Reports failure in `status`, `Status.malformed` or `Status.refused`, with the document empty.
 ///
@@ -359,7 +394,10 @@ Parsed parse(const(char)[] text) {
 		if (ok) foreach (i; 0 .. count) result.document.ids[i] = cast(uint) i;
 		else p.refused = true;
 	}
-	if (ok) return result;
+	if (ok) {
+		assert(validate(result.document), "bc.json: parsed a document that breaks its invariants");
+		return result;
+	}
 	free(result.document);
 	result.status = p.refused ? Status.refused : Status.malformed;
 	return result;
@@ -376,10 +414,12 @@ Parsed parse(const(char)[] text) {
 /// assert(!exists(root(d)));
 /// ---
 Value root(ref Document d) {
+	assert(fp.dynarray.length(d.nodes) == 0 || d.nodes[0].parent == dead, "bc.json: a first node that has a container");
 	return Value(&d, fp.dynarray.length(d.nodes) ? d.nodes[0].id : dead);
 }
 
-/// `d`'s JSON text, minified; empty for an empty document. It stays valid until the next edit.
+/// `d`'s JSON text, minified; empty for an empty document.
+/// It stays valid until the next edit.
 ///
 /// Examples:
 /// ---
@@ -431,10 +471,12 @@ size_t length(Value v) {
 	immutable step = v.document.nodes[n].kind == Kind.object ? 1 : 0;
 	size_t count = 0;
 	for (uint k = n + 1; k < v.document.nodes[n].skip; k = v.document.nodes[k + step].skip) ++count;
+	assert(count * (1 + step) <= v.document.nodes[n].skip - n - 1, "bc.json: more members than the container's descendants");
 	return count;
 }
 
-/// `v`'s JSON text, minified; null if it is missing. It stays valid until the next edit.
+/// `v`'s JSON text, minified; null if it is missing.
+/// It stays valid until the next edit.
 ///
 /// Examples:
 /// ---
@@ -444,10 +486,12 @@ size_t length(Value v) {
 /// ---
 const(char)[] source(Value v) {
 	immutable n = indexOf(v.document, v.id);
+	assert(n == dead || v.document.nodes[n].end <= fp.dynarray.length(v.document.text), "bc.json: a value past the document's text");
 	return n == dead ? null : v.document.text[v.document.nodes[n].start .. v.document.nodes[n].end];
 }
 
-/// A string's bytes between its quotes, escapes left as written, without allocating; null if `v` is not a string. It stays valid until the next edit.
+/// A string's bytes between its quotes, escapes left as written, without allocating; null if `v` is not a string.
+/// It stays valid until the next edit.
 ///
 /// Examples:
 /// ---
@@ -458,6 +502,7 @@ const(char)[] source(Value v) {
 const(char)[] view(Value v) {
 	if (kind(v) != Kind.string_) return null;
 	auto s = source(v);
+	assert(s.length >= 2 && s[0] == '"' && s[$ - 1] == '"', "bc.json: a string value without its quotes");
 	return s[1 .. $ - 1];
 }
 
@@ -491,7 +536,8 @@ std.typecons.Nullable!bool boolean(Value v) {
 	return k == Kind.true_ || k == Kind.false_ ? Result(k == Kind.true_) : Result.init;
 }
 
-/// A string's value with its escapes decoded, `\u` surrogate pairs included, as a new fp string the caller frees. The empty string, or anything not a string, gives a null pointer.
+/// A string's value with its escapes decoded, `\u` surrogate pairs included, as a new fp string the caller frees.
+/// The empty string, or anything not a string, gives a null pointer.
 ///
 /// Returns null (not a null pointer, but no value) only if an allocation is refused.
 ///
@@ -515,6 +561,7 @@ std.typecons.Nullable!(char*) decode(Value v) {
 			continue;
 		}
 		immutable u = unescape(s, i);
+		assert(u.next > i && u.next <= s.length, "bc.json.decode: an escape that did not advance, or ran past the string");
 		if (!fp.string.concatenate(out_, s[from .. i]) || !fp.string.concatenate(out_, u.bytes[0 .. u.length])) {
 			fp.string.free(out_);
 			return Result.init;
@@ -525,10 +572,13 @@ std.typecons.Nullable!(char*) decode(Value v) {
 		fp.string.free(out_);
 		return Result.init;
 	}
+	// The longest growth is a broken `\u`, two bytes decoding to U+FFFD's three.
+	assert(fp.string.length(out_) <= s.length + s.length / 2 + 1, "bc.json.decode: a decoded string longer than any escapes give");
 	return Result(out_);
 }
 
-/// `d`'s JSON laid out for reading: one member or element per line, each nesting level indented by `indent` once more, `": "` after keys, and empty containers kept as `{}` and `[]`. A new fp string the caller frees; a null pointer for an empty document.
+/// `d`'s JSON laid out for reading: one member or element per line, each nesting level indented by `indent` once more, `": "` after keys, and empty containers kept as `{}` and `[]`.
+/// A new fp string the caller frees; a null pointer for an empty document.
 ///
 /// Returns null (not a null pointer, but no value) only if an allocation is refused.
 ///
@@ -548,16 +598,21 @@ std.typecons.Nullable!(char*) pretty(ref const Document d, const(char)[] indent 
 		fp.string.free(out_);
 		return Result.init;
 	}
+	assert(fp.string.length(out_) >= fp.dynarray.length(d.text), "bc.json.pretty: laid out shorter than the minified text");
 	return Result(out_);
 }
 
-// Appends node `n` laid out at nesting `depth` to `out_`. False if refused.
+// bounded: the document's nesting, which a parsed one keeps to `maxDepth`
+// Appends node `n` laid out at nesting `depth` to `out_`.
+// False if refused.
 private bool layOut(ref const Document d, uint n, size_t depth, const(char)[] indent, ref char* out_) {
 	bool line(size_t level) {
 		if (!fp.string.concatenate(out_, "\n")) return false;
 		foreach (_; 0 .. level) if (!fp.string.concatenate(out_, indent)) return false;
 		return true;
 	}
+	assert(n < fp.dynarray.length(d.nodes), "bc.json: laying out a node past the document");
+	assert(depth <= maxDepth || d.nodes[n].kind < Kind.array, "bc.json: laying out deeper than any parsed document nests");
 	immutable node = d.nodes[n];
 	if ((node.kind != Kind.object && node.kind != Kind.array) || node.skip == n + 1) return fp.string.concatenate(out_, d.text[node.start .. node.end]);
 	immutable object = node.kind == Kind.object;
@@ -576,7 +631,8 @@ private bool layOut(ref const Document d, uint n, size_t depth, const(char)[] in
 
 // --- iterating ---------------------------------------------------------------
 
-/// An array's elements front to back, from `elements`. Removing the front element ends it early.
+/// An array's elements front to back, from `elements`.
+/// Removing the front element ends it early.
 struct Elements {
 @nogc nothrow:
 	Value front; /// The element at the front.
@@ -601,6 +657,7 @@ struct Elements {
 		immutable n = indexOf(d, front.id);
 		if (n == dead) return;
 		immutable next = d.nodes[n].skip;
+		assert(next > n, "bc.json: an element that does not skip past itself");
 		front = next < fp.dynarray.length(d.nodes) && d.nodes[next].parent == d.nodes[n].parent ? Value(d, d.nodes[next].id) : Value(d);
 	}
 }
@@ -618,6 +675,7 @@ struct Elements {
 Elements elements(Value v) {
 	immutable n = indexOf(v.document, v.id);
 	if (n == dead || v.document.nodes[n].kind != Kind.array || v.document.nodes[n].skip == n + 1) return Elements(Value(v.document));
+	assert(v.document.nodes[n + 1].parent == v.id, "bc.json: an array's first element belongs elsewhere");
 	return Elements(Value(v.document, v.document.nodes[n + 1].id));
 }
 
@@ -627,7 +685,8 @@ struct Member {
 	Value value; /// Its value.
 }
 
-/// An object's members in order, from `members`. Removing the front member ends it early.
+/// An object's members in order, from `members`.
+/// Removing the front member ends it early.
 struct Members {
 @nogc nothrow:
 	Value value; /// The front member's value.
@@ -647,7 +706,9 @@ struct Members {
 
 	/// Ditto
 	Member front() {
+		assert(!empty, "bc.json: front of finished members");
 		immutable key = value.document.nodes[indexOf(value.document, value.id) - 1];
+		assert(key.kind == Kind.string_ && key.end - key.start >= 2, "bc.json: a member whose key is not a string");
 		return Member(value.document.text[key.start + 1 .. key.end - 1], value);
 	}
 
@@ -657,6 +718,8 @@ struct Members {
 		immutable n = indexOf(d, value.id);
 		if (n == dead) return;
 		immutable next = d.nodes[n].skip;
+		assert(next > n, "bc.json: a member that does not skip past itself");
+		assert(next >= fp.dynarray.length(d.nodes) || d.nodes[next].parent != d.nodes[n].parent || next + 1 < fp.dynarray.length(d.nodes), "bc.json: a key without its value");
 		value = next < fp.dynarray.length(d.nodes) && d.nodes[next].parent == d.nodes[n].parent ? Value(d, d.nodes[next + 1].id) : Value(d);
 	}
 }
@@ -674,6 +737,8 @@ struct Members {
 Members members(Value v) {
 	immutable n = indexOf(v.document, v.id);
 	if (n == dead || v.document.nodes[n].kind != Kind.object || v.document.nodes[n].skip == n + 1) return Members(Value(v.document));
+	assert(v.document.nodes[n].skip >= n + 3, "bc.json: an object member with a key but no value");
+	assert(v.document.nodes[n + 1].kind == Kind.string_ && v.document.nodes[n + 2].parent == v.id, "bc.json: an object's first member is malformed");
 	return Members(Value(v.document, v.document.nodes[n + 2].id));
 }
 
@@ -685,16 +750,21 @@ private void reuse(ref Fragment f) {
 	fp.dynarray.clear(f.text);
 	fp.dynarray.clear(f.nodes);
 	f.refused = false;
+	assert(fp.dynarray.length(f.text) == 0 && fp.dynarray.length(f.nodes) == 0, "bc.json: a fragment not emptied for reuse");
 }
 
 private void put(ref Fragment f, const(char)[] bytes) {
+	immutable before = fp.dynarray.length(f.text);
 	if (!f.refused && bytes.length && !fp.dynarray.concatenate(f.text, bytes)) f.refused = true;
+	assert(f.refused || fp.dynarray.length(f.text) == before + bytes.length, "bc.json: a fragment that lost or gained bytes");
 }
 
 private void leaf(ref Fragment f, Kind kind, const(char)[] spelling) {
+	assert(kind != Kind.missing && spelling.length > 0, "bc.json: a leaf of no kind or no spelling");
 	immutable start = cast(uint) fp.dynarray.length(f.text), index = cast(uint) fp.dynarray.length(f.nodes);
 	put(f, spelling);
 	if (!f.refused && !fp.dynarray.pushBack(f.nodes, Node(kind, start, cast(uint) fp.dynarray.length(f.text), index + 1, 0, dead))) f.refused = true;
+	assert(f.refused || fp.dynarray.back(f.nodes).end - fp.dynarray.back(f.nodes).start == spelling.length, "bc.json: a leaf of the wrong length");
 }
 
 // Adds `s` as a string node, quoted and escaped.
@@ -724,6 +794,8 @@ private void quoted(ref Fragment f, const(char)[] s) {
 	put(f, s[from .. $]);
 	put(f, "\"");
 	if (!f.refused && !fp.dynarray.pushBack(f.nodes, Node(Kind.string_, start, cast(uint) fp.dynarray.length(f.text), index + 1, 0, dead))) f.refused = true;
+	assert(f.refused || fp.dynarray.length(f.text) - start >= s.length + 2, "bc.json: a quoted string shorter than its text and quotes");
+	assert(f.refused || f.text[start] == '"' && f.text[fp.dynarray.length(f.text) - 1] == '"', "bc.json: a quoted string without its quotes");
 }
 
 // Adds a deep copy of `v`, from any document; a missing one is a refusal if its document saw one.
@@ -743,6 +815,7 @@ private void copy(ref Fragment f, Value v) {
 		immutable parent = k == n ? dead : indexOf(d, node.parent) - n + first;
 		if (!fp.dynarray.pushBack(f.nodes, Node(node.kind, node.start - from + base, node.end - from + base, node.skip - n + first, 0, parent))) f.refused = true;
 	}
+	assert(f.refused || fp.dynarray.length(f.nodes) - first == d.nodes[n].skip - n, "bc.json: a copy with a different number of nodes");
 }
 
 // An empty container to write: what `setObject` and its kin pass as a value.
@@ -765,7 +838,37 @@ private void add(T)(ref Fragment f, T value) {
 	} else static assert(0, "bc.json: cannot write a " ~ T.stringof);
 }
 
-// Swaps bytes [at, at+cut) and nodes [first, first+drop) inside `parent` for `f`. Returns `f`'s first id, or `dead`, unchanged, on refusal.
+// Swaps bytes [at, at+cut) and nodes [first, first+drop) inside `parent` for `f`.
+// Returns `f`'s first id, or `dead`, unchanged, on refusal.
+/// Whether `d`'s nodes and ids agree with one another and with its text: each node lies within the text and within its parent, its descendants follow it up to its `skip`, the root's run covers every node, and `ids` maps each live id to the node holding it.
+/// It reads only `d`, so every parse and edit asserts it.
+///
+/// Examples:
+/// ---
+/// auto p = parse(`{"a":[1,2]}`);
+/// scope(exit) free(p.document);
+/// assert(validate(p.document));
+/// p.document.nodes[1].skip = 9;
+/// assert(!validate(p.document));
+/// ---
+bool validate(ref const Document d) @trusted {
+	immutable count = fp.dynarray.length(d.nodes), bytes = fp.dynarray.length(d.text), ids = fp.dynarray.length(d.ids);
+	if (count == 0) return bytes == 0;
+	if (d.nodes[0].parent != dead || d.nodes[0].skip != count) return false;
+	foreach (k; 0 .. count) {
+		const n = &d.nodes[k];
+		if (n.kind == Kind.missing || n.start > n.end || n.end > bytes || n.skip <= k || n.skip > count) return false;
+		if (n.id >= ids || d.ids[n.id] != k) return false;
+		if (k == 0) continue;
+		if (n.parent >= ids || d.ids[n.parent] >= k) return false;
+		const parent = &d.nodes[d.ids[n.parent]];
+		if (n.start < parent.start || n.end > parent.end || n.skip > parent.skip) return false;
+	}
+	foreach (id; 0 .. ids)
+		if (d.ids[id] != dead && (d.ids[id] >= count || d.nodes[d.ids[id]].id != id)) return false;
+	return true;
+}
+
 private uint splice(ref Document d, uint parent, uint at, uint cut, uint first, uint drop, ref const Fragment f) {
 	if (f.refused) {
 		d.refused = true;
@@ -810,6 +913,7 @@ private uint splice(ref Document d, uint parent, uint at, uint cut, uint first, 
 		foreach (j; 0 .. fresh) d.ids[ids + j] = cast(uint) (first + j);
 	}
 	foreach (k; first + fresh .. fp.dynarray.length(d.nodes)) d.ids[d.nodes[k].id] = cast(uint) k;
+	assert(validate(d), "bc.json: an edit broke the document's invariants");
 	return fresh ? cast(uint) ids : dead;
 }
 
@@ -819,10 +923,12 @@ private uint target(Value v, Kind kind, string message) {
 	immutable n = indexOf(v.document, v.id);
 	assert(n != dead || v.document.refused, "bc.json: editing a missing value");
 	assert(n == dead || kind == Kind.missing || v.document.nodes[n].kind == kind, message);
+	assert(fp.dynarray.length(v.document.scratch.text) == 0 && fp.dynarray.length(v.document.scratch.nodes) == 0, "bc.json: an edit begun inside another, whose scratch is in use");
 	return n;
 }
 
-/// Replaces all of `d` with `value`: a `bool`, an integer, a string, `null`, or a `Value` (from any document, this one included) to copy. Like every edit, it records a refusal in `d.refused` as well as in what it returns, so a run of edits can be checked once at its end.
+/// Replaces all of `d` with `value`: a `bool`, an integer, a string, `null`, or a `Value` (from any document, this one included) to copy.
+/// Like every edit, it records a refusal in `d.refused` as well as in what it returns, so a run of edits can be checked once at its end.
 ///
 /// Returns the new root, or a missing value, leaving `d` as it was and setting `d.refused`, if an allocation is refused.
 ///
@@ -859,7 +965,8 @@ Value setObject(ref Document d) { return set(d, Empty(Kind.object)); }
 /// Ditto
 Value setArray(ref Document d) { return set(d, Empty(Kind.array)); }
 
-/// Replaces `v`, which must not be missing, with `value`, as `set` takes one, keeping its place: its key, if it is a member, or its position. `v` and every value inside it read as missing from then on.
+/// Replaces `v`, which must not be missing, with `value`, as `set` takes one, keeping its place: its key, if it is a member, or its position.
+/// `v` and every value inside it read as missing from then on.
 ///
 /// Returns the new value, or a missing value, leaving the document as it was and setting `refused`, if an allocation is refused.
 ///
@@ -1000,7 +1107,8 @@ Value appendObject(Value array) { return append(array, Empty(Kind.object)); }
 /// Ditto
 Value appendArray(Value array) { return append(array, Empty(Kind.array)); }
 
-/// Inserts `value`, as `set` takes one, into `array`, which must be an array, before element `i`, which may be one past the last. Past that, it does nothing after an earlier refusal, which may have left the array short, and asserts otherwise.
+/// Inserts `value`, as `set` takes one, into `array`, which must be an array, before element `i`, which may be one past the last.
+/// Past that, it does nothing after an earlier refusal, which may have left the array short, and asserts otherwise.
 ///
 /// Returns the new element, or a missing value, leaving the document as it was and setting `refused`, if an allocation is refused.
 ///
@@ -1046,7 +1154,9 @@ Value insertObject(Value array, size_t i) { return insert(array, i, Empty(Kind.o
 /// Ditto
 Value insertArray(Value array, size_t i) { return insert(array, i, Empty(Kind.array)); }
 
-/// Removes `v` from its container, with its key if it is a member; removing the root empties the document. Every value inside it reads as missing from then on. It never allocates.
+/// Removes `v` from its container, with its key if it is a member; removing the root empties the document.
+/// Every value inside it reads as missing from then on.
+/// It never allocates.
 ///
 /// Returns false, changing nothing, if `v` is missing.
 ///
@@ -1066,6 +1176,7 @@ bool remove(Value v) {
 	immutable node = d.nodes[n];
 	if (node.parent == dead) {
 		cast(void) splice(*d, dead, 0, cast(uint) fp.dynarray.length(d.text), 0, cast(uint) fp.dynarray.length(d.nodes), nothing);
+		assert(fp.dynarray.length(d.nodes) == 0, "bc.json.remove: removing the root left nodes");
 		return true;
 	}
 	immutable p = indexOf(d, node.parent);
@@ -1100,7 +1211,7 @@ version (unittest) {
 unittest { // parsing minifies, rejects what is not one value, and reads numbers, booleans and escapes
 	auto p = parse(" {\n\t\"list\" : [0, \"a b\", {}, [ ]],\r\"n\": null } ");
 	scope(exit) free(p.document);
-	assert(p.status == Status.ok && json(p.document) == `{"list":[0,"a b",{},[]],"n":null}` && consistent(p.document));
+	assert(p.status == Status.ok && json(p.document) == `{"list":[0,"a b",{},[]],"n":null}` && consistent(p.document) && validate(p.document));
 	auto r = root(p.document);
 	assert(length(r["list"]) == 4 && kind(r["list"][2]) == Kind.object && kind(r["n"]) == Kind.null_);
 	assert(!exists(r["list"]["x"]) && !exists(r["n"][0]) && !exists(Value.init["a"]));
@@ -1133,6 +1244,12 @@ unittest { // parsing minifies, rejects what is not one value, and reads numbers
 	auto joined = decode(root(pair.document));
 	scope(exit) fp.string.free(joined.get);
 	assert(fp.string.slice(joined.get) == "\U0001F600!");
+	// A broken `\u` decodes longer than it is spelled: two bytes to U+FFFD's three.
+	auto broken = parse(`"\u\u"`);
+	scope(exit) free(broken.document);
+	auto grown = decode(root(broken.document));
+	scope(exit) fp.string.free(grown.get);
+	assert(fp.string.slice(grown.get) == "��" && fp.string.length(grown.get) > view(root(broken.document)).length);
 
 	auto keys = parse(`{"a\"b":1,"é":2,"ab":3}`);
 	scope(exit) free(keys.document);
@@ -1291,4 +1408,61 @@ unittest { // a refused edit changes nothing but sets `refused`, and later edits
 	}
 	fp.testing.restoreAllocator(previous);
 	assert(!many.refused && length(list) == 1000 && integer(list[998]["line"]).get == 499 && consistent(many));
+}
+
+unittest { // seeded: random documents parse, lay out and parse again to the same text; damaged or rationed ones fail cleanly or parse consistently
+	static import fp.algorithms;
+	static import fp.testing;
+	static immutable string[6] scalars = [`0`, `-12.5e3`, `true`, `null`, `"a b"`, `"\u00e9\n"`];
+	static immutable string[4] gaps = ["", " ", "\n\t", "\r\n  "];
+
+	static bool write(ref fp.algorithms.Random random, ref char* out_, size_t depth) {
+		bool gap() { return fp.string.concatenate(out_, gaps[fp.algorithms.randomBelow(random, gaps.length)]); }
+		immutable kind = depth >= 6 ? 0 : fp.algorithms.randomBelow(random, 4);
+		if (kind < 2) return gap() && fp.string.concatenate(out_, scalars[fp.algorithms.randomBelow(random, scalars.length)]) && gap();
+		immutable object = kind == 2;
+		if (!gap() || !fp.string.concatenate(out_, object ? "{" : "[")) return false;
+		immutable count = fp.algorithms.randomBelow(random, 4);
+		foreach (i; 0 .. count) {
+			if (i && !fp.string.concatenate(out_, ",")) return false;
+			if (object && !(gap() && fp.string.append(out_, '"', "k", i, '"') && gap() && fp.string.concatenate(out_, ":"))) return false;
+			if (!write(random, out_, depth + 1)) return false;
+		}
+		return gap() && fp.string.concatenate(out_, object ? "}" : "]") && gap();
+	}
+
+	auto random = fp.algorithms.createRandom(404);
+	size_t refused = 0, malformed = 0;
+	foreach (round; 0 .. 300) {
+		char* text = null;
+		scope(exit) fp.string.free(text);
+		assert(write(random, text, 0));
+		auto first = parse(fp.string.slice(text));
+		scope(exit) free(first.document);
+		assert(first.status == Status.ok && consistent(first.document));
+
+		auto laidOut = pretty(first.document, gaps[1 + fp.algorithms.randomBelow(random, 3)]);
+		assert(!laidOut.isNull);
+		scope(exit) fp.string.free(laidOut.get);
+		auto second = parse(fp.string.slice(laidOut.get));
+		scope(exit) free(second.document);
+		assert(second.status == Status.ok && json(second.document) == json(first.document));
+		auto third = parse(json(first.document));
+		scope(exit) free(third.document);
+		assert(third.status == Status.ok && json(third.document) == json(first.document));
+
+		auto previous = fp.testing.limitAllocations(fp.algorithms.randomBelow(random, 3));
+		auto rationed = parse(fp.string.slice(text));
+		fp.testing.restoreAllocator(previous);
+		scope(exit) free(rationed.document);
+		refused += rationed.status != Status.ok;
+		assert(rationed.status == Status.ok ? json(rationed.document) == json(first.document) : rationed.document.nodes is null && rationed.document.text is null);
+
+		text[fp.algorithms.randomBelow(random, fp.string.length(text))] = "{}[],:\"x0 "[fp.algorithms.randomBelow(random, 10)];
+		auto damaged = parse(fp.string.slice(text));
+		scope(exit) free(damaged.document);
+		malformed += damaged.status == Status.malformed;
+		assert(damaged.status == Status.malformed ? damaged.document.nodes is null : consistent(damaged.document));
+	}
+	assert(refused > 30 && malformed > 100);
 }
