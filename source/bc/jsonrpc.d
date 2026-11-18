@@ -28,7 +28,12 @@ static import fp.io;
 
 // --- reading -----------------------------------------------------------------
 
-/// Reads framed messages from `fd`. Plain data, released by `free`; it does not close `fd`. On Windows, reading puts `fd` in binary mode, as `fp.io.readSome` does, so the C runtime does not translate line ends.
+/// The longest message body `next` accepts; a `Content-Length` past it, or not a decimal number, closes the reader rather than ask for that much memory.
+enum size_t maxBodyBytes = size_t(1) << 30;
+
+/// Reads framed messages from `fd`.
+/// Plain data, released by `free`; it does not close `fd`.
+/// On Windows, reading puts `fd` in binary mode, as `fp.io.readSome` does, so the C runtime does not translate line ends.
 struct Reader {
 	int fd; /// Where messages come from.
 	bool closed; /// Set once `fd` has ended or failed, or an allocation was refused.
@@ -44,14 +49,15 @@ struct Reader {
 /// free(r);
 /// ---
 void free(ref Reader r) {
+	assert(r.start <= fp.dynarray.length(r.buffer), "bc.jsonrpc: a reader's start past its buffer");
 	fp.dynarray.free(r.buffer);
-	r.buffer = null;
 	r.start = 0;
 }
 
 // Where a message's body starts in its reader's buffer, and how long it is.
 private struct Frame {
 	size_t bodyStart, bodyLength;
+	bool oversized; // its length was malformed or passed `maxBodyBytes`, so its body is never read
 }
 
 // The frame of the message at `r.start`, whose body may not be buffered yet; null until its header is.
@@ -66,21 +72,22 @@ private std.typecons.Nullable!Frame framed(ref const Reader r) @trusted {
 		size_t stop = line;
 		while (stop < end && bytes[stop] != '\r') ++stop;
 		auto header = bytes[line .. stop];
-		if (header.length > field.length && fp.string.ascii.startsWithIgnoringCase(header, field)) {
-			foreach (c; header[field.length .. $]) {
-				if (c == ' ') continue;
-				if (c < '0' || c > '9') break;
-				bodyLength = bodyLength * 10 + (c - '0');
-			}
+		if (fp.string.ascii.startsWithIgnoringCase(header, field)) {
+			// A length that is malformed or too large for a `ulong` is past the limit too, so the reader closes rather than misframe.
+			immutable parsed = fp.string.numbers.parseUnsigned(fp.string.trim(header[field.length .. $], " \t"));
+			bodyLength = parsed.isNull || parsed.get.value > maxBodyBytes ? maxBodyBytes + 1 : cast(size_t) parsed.get.value;
 		}
+		assert(stop <= end, "bc.jsonrpc: a header line past the header block");
 		line = stop + 2;
 	}
-	return typeof(return)(Frame(r.start + end + 4, bodyLength));
+	assert(r.start + end + 4 <= fp.dynarray.length(r.buffer), "bc.jsonrpc: a header block past what was read");
+	return typeof(return)(Frame(r.start + end + 4, bodyLength, bodyLength > maxBodyBytes));
 }
 
 // Whether the whole of the message `frame` describes is in `r.buffer`.
 private bool arrived(ref const Reader r, std.typecons.Nullable!Frame frame) {
-	return !frame.isNull && frame.get.bodyStart + frame.get.bodyLength <= fp.dynarray.length(r.buffer);
+	assert(frame.isNull || frame.get.oversized || frame.get.bodyLength <= maxBodyBytes, "bc.jsonrpc: a frame past the limit not marked so");
+	return !frame.isNull && !frame.get.oversized && frame.get.bodyStart + frame.get.bodyLength <= fp.dynarray.length(r.buffer);
 }
 
 /// Whether a whole message is already buffered, so `next` would not wait: a server drains a burst of edits before answering any.
@@ -109,8 +116,10 @@ const(char)[] next(ref Reader r) @trusted {
 			immutable frame = framed(r);
 			if (arrived(r, frame)) {
 				r.start = frame.get.bodyStart + frame.get.bodyLength;
+				assert(r.start <= fp.dynarray.length(r.buffer), "bc.jsonrpc: a message past what was read");
 				return r.buffer[frame.get.bodyStart .. r.start];
 			}
+			if (!frame.isNull && frame.get.oversized) r.closed = true;
 		}
 		if (r.closed) return null;
 		// What was handed out goes before more is read, so the buffer holds one message at most plus what follows it.
@@ -127,6 +136,7 @@ const(char)[] next(ref Reader r) @trusted {
 			immutable frame = framed(r);
 			if (!frame.isNull && frame.get.bodyStart + frame.get.bodyLength - kept > chunk) size = frame.get.bodyStart + frame.get.bodyLength - kept;
 		}
+		assert(size <= maxBodyBytes + chunk, "bc.jsonrpc: reading room past the body limit");
 		if (fp.dynarray.growToSize(r.buffer, kept + size) is null) {
 			r.closed = true;
 			return null;
@@ -134,13 +144,15 @@ const(char)[] next(ref Reader r) @trusted {
 		immutable got = fp.io.readSome(r.fd, r.buffer[kept .. kept + size]);
 		cast(void) fp.dynarray.removeLast(r.buffer, size - (got > 0 ? got : 0));
 		if (got <= 0) r.closed = true;
+		assert(fp.dynarray.length(r.buffer) == kept + (got > 0 ? got : 0), "bc.jsonrpc: kept other than what was read");
 	}
 }
 
 
 // --- writing -----------------------------------------------------------------
 
-/// Writes `body` to `fd` as one message, its `Content-Length` header first. On Windows it puts `fd` in binary mode first, as reading does.
+/// Writes `body` to `fd` as one message, its `Content-Length` header first.
+/// On Windows it puts `fd` in binary mode first, as reading does.
 ///
 /// Returns false if `fd` fails, perhaps partway through the message.
 ///
@@ -152,61 +164,24 @@ bool send(int fd, const(char)[] body) {
 	char[48] header = "Content-Length: ";
 	size_t at = 16;
 	char[fp.string.numbers.maxDecimalLength] digits;
+	assert(body.length <= maxBodyBytes, "bc.jsonrpc.send: a body longer than a reader accepts");
 	foreach (c; fp.string.numbers.formatUnsigned(body.length, digits)) header[at++] = c;
 	foreach (c; "\r\n\r\n") header[at++] = c;
+	assert(at <= header.length, "bc.jsonrpc.send: a header past its buffer");
 	return fp.io.writeAll(fd, header[0 .. at]) && fp.io.writeAll(fd, body);
 }
 
 
-version (unittest) {
-	version (WASI) {
-		static import core.sys.posix.fcntl;
-
-		// druntime declares no lseek for WASI, whose off_t is 64 bits.
-		private extern (C) long lseek(int fd, long offset, int whence);
-	} else static import core.stdc.stdio;
-
-	version (Windows) {
-		private extern (C) {
-			int _setmode(int fd, int mode);
-			int _dup(int fd);
-			int _lseek(int fd, int offset, int whence);
-		}
-	}
-
-	// A file to write messages into and read back: WASI preview 1 has neither pipes nor tmpfile.
-	private int scratch() @trusted {
-		version (WASI) return core.sys.posix.fcntl.open("/tmp/bc-jsonrpc-test", core.sys.posix.fcntl.O_RDWR | core.sys.posix.fcntl.O_CREAT | core.sys.posix.fcntl.O_TRUNC, 384);
-		else {
-			auto file = core.stdc.stdio.tmpfile();
-			assert(file !is null);
-			scope(exit) cast(void) core.stdc.stdio.fclose(file);
-			version (Windows) return _dup(core.stdc.stdio.fileno(file));
-			else {
-				static import core.sys.posix.unistd;
-				return core.sys.posix.unistd.dup(core.stdc.stdio.fileno(file));
-			}
-		}
-	}
-
-	// Moves `fd` back to its start, to read what was written.
-	private bool rewind(int fd) {
-		version (WASI) return lseek(fd, 0, 0) == 0;
-		else version (Windows) return _lseek(fd, 0, 0) == 0;
-		else {
-			static import core.sys.posix.unistd;
-			return core.sys.posix.unistd.lseek(fd, 0, 0) == 0;
-		}
-	}
-}
+version (unittest) version (Windows) private extern (C) int _setmode(int fd, int mode);
 
 unittest { // messages split across writes and run together come out whole and in order, and a header block without a length is skipped
-	immutable fd = scratch();
-	assert(fd >= 0);
-	scope(exit) cast(void) fp.io.close(fd);
+	static import fp.testing;
+	auto scratch = fp.testing.openScratchFile().get;
+	scope(exit) fp.testing.free(scratch);
+	immutable fd = scratch.descriptor;
 	static immutable stream = "Content-Length: 7\r\nContent-Type: x\r\n\r\n{\"a\":1}content-length:2\r\n\r\n[]X-Other: 1\r\n\r\nContent-Length: 0\r\n\r\n";
 	foreach (i; 0 .. stream.length) assert(fp.io.writeSome(fd, stream[i .. i + 1]) == 1);
-	assert(rewind(fd));
+	assert(fp.io.rewind(fd));
 	Reader r = Reader(fd);
 	scope(exit) free(r);
 	assert(next(r) == `{"a":1}`);
@@ -216,15 +191,15 @@ unittest { // messages split across writes and run together come out whole and i
 	assert(next(r) is null && r.closed);
 
 	// A message many reads long arrives whole, read into room made once its header is in.
-	immutable big = scratch();
-	assert(big >= 0);
-	scope(exit) cast(void) fp.io.close(big);
+	auto bigScratch = fp.testing.openScratchFile().get;
+	scope(exit) fp.testing.free(bigScratch);
+	immutable big = bigScratch.descriptor;
 	enum size_t size = 3 << 20;
 	char* body = null;
 	scope(exit) fp.dynarray.free(body);
 	assert(fp.dynarray.growToSize(body, size) !is null);
 	foreach (i; 0 .. size) body[i] = cast(char) ('a' + i % 26);
-	assert(send(big, body[0 .. size]) && rewind(big));
+	assert(send(big, body[0 .. size]) && fp.io.rewind(big));
 	Reader large = Reader(big);
 	scope(exit) free(large);
 	assert(next(large) == body[0 .. size]);
@@ -232,20 +207,54 @@ unittest { // messages split across writes and run together come out whole and i
 
 	// A descriptor in text mode is switched to binary, so line ends in a body are neither added to nor taken away.
 	version (Windows) {
-		immutable text = scratch();
-		assert(text >= 0);
-		scope(exit) cast(void) fp.io.close(text);
+		auto textScratch = fp.testing.openScratchFile().get;
+		scope(exit) fp.testing.free(textScratch);
+		immutable text = textScratch.descriptor;
 		enum int textMode = 0x4000;
 		cast(void) _setmode(text, textMode);
-		assert(send(text, "a\r\nb\nc") && rewind(text));
+		assert(send(text, "a\r\nb\nc") && fp.io.rewind(text));
 		cast(void) _setmode(text, textMode);
 		Reader translated = Reader(text);
 		scope(exit) free(translated);
 		assert(next(translated) == "a\r\nb\nc");
 	}
 
+	// A length past the limit closes the reader, however many digits it has, without reading its body.
+	auto hugeScratch = fp.testing.openScratchFile().get;
+	scope(exit) fp.testing.free(hugeScratch);
+	immutable huge = hugeScratch.descriptor;
+	static immutable oversized = "Content-Length: 99999999999999999999999999\r\n\r\n{}";
+	assert(fp.io.writeAll(huge, oversized) && fp.io.rewind(huge));
+	Reader refused = Reader(huge);
+	scope(exit) free(refused);
+	assert(next(refused) is null && refused.closed);
+	assert(fp.dynarray.capacity(refused.buffer) < (1 << 17)); // no room was asked for the claimed body
+	auto pastScratch = fp.testing.openScratchFile().get;
+	scope(exit) fp.testing.free(pastScratch);
+	immutable past = pastScratch.descriptor;
+	assert(fp.io.writeAll(past, "Content-Length: 17179869184\r\n\r\n{}") && fp.io.rewind(past));
+	Reader tooLong = Reader(past);
+	scope(exit) free(tooLong);
+	assert(next(tooLong) is null && tooLong.closed && fp.dynarray.capacity(tooLong.buffer) < (1 << 17));
+
+	// A length that is not a decimal number closes the reader too, rather than frame the stream at a guess.
+	static immutable string[3] malformedLengths = ["Content-Length: 1x\r\n\r\n{}", "Content-Length:\r\n\r\n{}", "Content-Length: -2\r\n\r\n{}"];
+	foreach (malformed; malformedLengths) {
+		auto malformedScratch = fp.testing.openScratchFile().get;
+		scope(exit) fp.testing.free(malformedScratch);
+		assert(fp.io.writeAll(malformedScratch.descriptor, malformed) && fp.io.rewind(malformedScratch.descriptor));
+		Reader unframed = Reader(malformedScratch.descriptor);
+		scope(exit) free(unframed);
+		assert(next(unframed) is null && unframed.closed);
+	}
+	auto spacedScratch = fp.testing.openScratchFile().get;
+	scope(exit) fp.testing.free(spacedScratch);
+	assert(fp.io.writeAll(spacedScratch.descriptor, "Content-Length: \t2 \r\n\r\n{}") && fp.io.rewind(spacedScratch.descriptor));
+	Reader spaced = Reader(spacedScratch.descriptor);
+	scope(exit) free(spaced);
+	assert(next(spaced) == "{}");
+
 	// No room to read into closes the reader.
-	static import fp.testing;
 	Reader starved = Reader(big);
 	scope(exit) free(starved);
 	auto previous = fp.testing.limitAllocations(0);

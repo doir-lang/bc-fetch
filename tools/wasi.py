@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Builds the unittests for wasm32-wasi, and a reactor module for the main-thread check, and runs them under Node or serves them to a browser, against routes this script serves.
 
-The build links against a wasi-sdk sysroot and compiler-rt builtins, downloaded once into bin/wasi-sdk unless WASI_SYSROOT and WASI_BUILTINS name local copies. It links with `wasm-ld` from PATH (or WASM_LD), falling back to LDC's internal linker.
+The build links against a wasi-sdk sysroot and compiler-rt builtins, downloaded once into bin/wasi-sdk unless WASI_SYSROOT and WASI_BUILTINS name local copies.
+It links with `wasm-ld` from PATH (or WASM_LD), falling back to LDC's internal linker.
 
 Usage:
   tools/wasi.py            build bin/wasi/bc-fetch-tests.wasm, bin/wasi/bc-fetch-reactor.wasm and the scripts that run them
